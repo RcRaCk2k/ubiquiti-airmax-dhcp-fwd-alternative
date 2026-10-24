@@ -232,15 +232,26 @@ struct bucket {
 	time_t		last;
 };
 
+/* runtime state per bridge port, same index as cfg.port[] */
+struct pstate {
+	int		fd;
+	int		ifindex;
+	struct bucket	tb;
+	uint32_t	rx;
+	uint32_t	tx;
+};
+
 struct xid_ent {
 	uint32_t	xid;
 	uint8_t		mac[6];
 	uint8_t		kind;		/* 0 free, 1 marked, 2 passthrough */
 	uint8_t		answered;
+	int		port;		/* client port the request came from */
 	time_t		t;
 };
 
 static struct stats st;
+static struct pstate ps[MAX_PORTS];
 static struct xid_ent xids[XID_SLOTS];
 static int stats_fd = -1;
 
@@ -284,7 +295,8 @@ static struct xid_ent *xid_find(uint32_t xid, const uint8_t *mac)
 	return NULL;
 }
 
-static void xid_add(uint32_t xid, const uint8_t *mac, int kind, time_t now)
+static void xid_add(uint32_t xid, const uint8_t *mac, int kind, int port,
+		    time_t now)
 {
 	struct xid_ent *e = xid_find(xid, mac), *old = &xids[0];
 	int i;
@@ -305,44 +317,62 @@ static void xid_add(uint32_t xid, const uint8_t *mac, int kind, time_t now)
 	memcpy(e->mac, mac, 6);
 	e->kind = (uint8_t)kind;
 	e->answered = 0;
+	e->port = port;
 	e->t = now;
 }
 
 static void write_stats(time_t started, unsigned restarts)
 {
-	char buf[2048], cid[256], rid[256];
-	int n = 0;
+	char buf[4096], cid[256], rid[256];
+	size_t n = 0;
+	int i;
+
+#define ADD(...) do {							\
+		if (n + 1 < sizeof(buf)) {				\
+			int r_ = snprintf(buf + n, sizeof(buf) - n,	\
+					  __VA_ARGS__);			\
+			if (r_ > 0)					\
+				n += (size_t)r_ < sizeof(buf) - n ?	\
+				     (size_t)r_ : sizeof(buf) - n - 1;	\
+		}							\
+	} while (0)
 
 	if (stats_fd < 0)
 		return;
-	n += snprintf(buf + n, sizeof(buf) - (size_t)n,
-		      "version %s\npid %d\nuptime %ld\nworker_restarts %u\n"
-		      "client_if %s\nuplink_if %s\ncircuit_id %s\nremote_id %s\n",
-		      VERSION, (int)getpid(), (long)(mono() - started),
-		      restarts, cfg.client_if, cfg.uplink_if,
-		      id_str(cfg.o82.cid, cfg.o82.cid_len, cid, sizeof(cid)),
-		      id_str(cfg.o82.rid, cfg.o82.rid_len, rid, sizeof(rid)));
-#define X(f) n += snprintf(buf + n, sizeof(buf) - (size_t)n, #f " %u\n", st.f);
+	ADD("version %s\npid %d\nuptime %ld\nworker_restarts %u\n",
+	    VERSION, (int)getpid(), (long)(mono() - started), restarts);
+	for (i = 0; i < cfg.nport; i++) {
+		const struct port *p = &cfg.port[i];
+
+		ADD("port %s bridge=%s role=%s lower=%s rx=%u tx=%u", p->name,
+		    cfg.br[p->bridge].name, role_str(p->role), p->lower,
+		    ps[i].rx, ps[i].tx);
+		if (p->role == ROLE_CLIENT)
+			ADD(" circuit_id=\"%s\" remote_id=\"%s\"",
+			    id_str(p->o82.cid, p->o82.cid_len, cid, sizeof(cid)),
+			    id_str(p->o82.rid, p->o82.rid_len, rid, sizeof(rid)));
+		ADD("\n");
+	}
+#define X(f) ADD(#f " %u\n", st.f);
 	STATS_FIELDS(X)
 #undef X
-	if (n > (int)sizeof(buf))
-		n = sizeof(buf);
+#undef ADD
 	if (ftruncate(stats_fd, 0) == 0)
-		(void)!pwrite(stats_fd, buf, (size_t)n, 0);
+		(void)!pwrite(stats_fd, buf, n, 0);
 }
 
 static void log_packet(const char *ifname, int ifindex, const char *action,
-		       const struct dhcp_info *in)
+		       const char *to, const struct dhcp_info *in)
 {
 	char sm[18], dm[18], ch[18], si[16], di[16], gi[16], c[128], r[128];
 
 	if (!log_enabled(LOG_LVL_INFO))
 		return;
 	log_pkt(LOG_LVL_INFO,
-		"%s if=%s/%d type=%s xid=0x%08x chaddr=%s src=%s/%s dst=%s/%s "
-		"giaddr=%s hops=%u reason=%s cid=\"%s\" rid=\"%s\"",
-		action, ifname, ifindex, dhcp_type_str(in->msgtype), in->xid,
-		mac_str(in->chaddr, ch), mac_str(in->src_mac, sm),
+		"%s if=%s/%d to=%s type=%s xid=0x%08x chaddr=%s src=%s/%s "
+		"dst=%s/%s giaddr=%s hops=%u reason=%s cid=\"%s\" rid=\"%s\"",
+		action, ifname, ifindex, to, dhcp_type_str(in->msgtype),
+		in->xid, mac_str(in->chaddr, ch), mac_str(in->src_mac, sm),
 		ip_str(in->ip_src, si), mac_str(in->dst_mac, dm),
 		ip_str(in->ip_dst, di), ip_str(in->giaddr, gi), in->hops,
 		dhcp_reason_str(in->reason),
@@ -350,15 +380,39 @@ static void log_packet(const char *ifname, int ifindex, const char *action,
 		id_str(in->o82_rid, in->o82_rid_len, r, sizeof(r)));
 }
 
-static int xmit(int fd, const uint8_t *buf, size_t len, uint32_t *ok)
+/* returns -1 if the worker must restart */
+static int xmit(int port, const uint8_t *buf, size_t len, uint32_t *ok)
 {
-	if (send(fd, buf, len, 0) == (ssize_t)len) {
+	if (send(ps[port].fd, buf, len, 0) == (ssize_t)len) {
 		(*ok)++;
+		ps[port].tx++;
 		return 0;
 	}
 	st.tx_error++;
-	LOGW("send: %s", strerror(errno));
+	LOGW("send on %s: %s", cfg.port[port].name, strerror(errno));
 	return errno == ENXIO || errno == ENODEV ? -1 : 0;
+}
+
+/* sends to every port of the bridge with the given role (or one port),
+ * like the bridge would flood it */
+static int xmit_role(int bridge, int role, int only, const uint8_t *buf,
+		     size_t len, uint32_t *ok, char *to, size_t tolen)
+{
+	size_t o = 0;
+	int i;
+
+	to[0] = '\0';
+	for (i = 0; i < cfg.nport; i++) {
+		if (cfg.port[i].bridge != bridge || cfg.port[i].role != role ||
+		    (only >= 0 && i != only))
+			continue;
+		if (o + strlen(cfg.port[i].name) + 2 < tolen)
+			o += (size_t)sprintf(to + o, "%s%s", o ? "," : "",
+					     cfg.port[i].name);
+		if (xmit(i, buf, len, ok) < 0)
+			return -1;
+	}
+	return 0;
 }
 
 static void count_request(enum reason r)
@@ -374,42 +428,60 @@ static void count_request(enum reason r)
 	}
 }
 
-/* returns -1 if the worker must restart */
-static int handle_client(int fd_in, int fd_out, int ifindex, time_t now,
-			 struct bucket *tb)
+static ssize_t receive(int port, uint8_t *buf, size_t cap, time_t now,
+		       uint32_t *ratelimited)
+{
+	struct sockaddr_ll sll;
+	socklen_t sl = sizeof(sll);
+	ssize_t n;
+
+	for (;;) {
+		n = recvfrom(ps[port].fd, buf, cap, MSG_TRUNC,
+			     (struct sockaddr *)&sll, &sl);
+		if (n < 0)
+			return -1;
+		ps[port].rx++;
+		if (cfg.port[port].role == ROLE_CLIENT)
+			st.rx_client++;
+		else
+			st.rx_uplink++;
+		if (sll.sll_pkttype == PACKET_OUTGOING) {
+			st.rx_outgoing_ignored++;
+			continue;
+		}
+		if ((size_t)n > cap) {
+			st.rx_truncated++;
+			continue;
+		}
+		if (!bucket_take(&ps[port].tb, now)) {
+			(*ratelimited)++;
+			continue;
+		}
+		return n;
+	}
+}
+
+static int handle_client(int port, time_t now)
 {
 	static uint8_t buf[FRAME_BUF_LEN];
-	struct sockaddr_ll sll;
+	const struct port *p = &cfg.port[port];
 	struct dhcp_info info;
+	char to[128];
 	int i;
 
 	for (i = 0; i < BURST_PER_POLL; i++) {
-		socklen_t sl = sizeof(sll);
-		ssize_t n = recvfrom(fd_in, buf, sizeof(buf), MSG_TRUNC,
-				     (struct sockaddr *)&sll, &sl);
+		ssize_t n = receive(port, buf, sizeof(buf), now,
+				    &st.req_ratelimited);
 		size_t len;
 		enum verdict v;
 
 		if (n < 0)
 			return 0;
-		st.rx_client++;
-		if (sll.sll_pkttype == PACKET_OUTGOING) {
-			st.rx_outgoing_ignored++;
-			continue;
-		}
-		if ((size_t)n > sizeof(buf)) {
-			st.rx_truncated++;
-			continue;
-		}
-		if (!bucket_take(tb, now)) {
-			st.req_ratelimited++;
-			continue;
-		}
 		len = (size_t)n;
-		v = dhcp_handle_request(buf, &len, sizeof(buf), &cfg.o82, &info);
+		v = dhcp_handle_request(buf, &len, sizeof(buf), &p->o82, &info);
 		count_request(info.reason);
 		if (info.reason == R_HAS_O82 || info.reason == R_RELAYED) {
-			xid_add(info.xid, info.chaddr, 2, now);
+			xid_add(info.xid, info.chaddr, 2, port, now);
 			if (cfg.existing_o82 == POL_DROP) {
 				v = VERDICT_DROP;
 				st.req_dropped_policy++;
@@ -419,58 +491,82 @@ static int handle_client(int fd_in, int fd_out, int ifindex, time_t now,
 			v = VERDICT_DROP;
 			st.req_dropped_policy++;
 		} else if (info.reason == R_INSERTED) {
-			xid_add(info.xid, info.chaddr, 1, now);
+			xid_add(info.xid, info.chaddr, 1, port, now);
 			/* log what we put in, not what came in */
-			memcpy(info.o82_cid, cfg.o82.cid, cfg.o82.cid_len);
-			info.o82_cid_len = cfg.o82.cid_len;
-			memcpy(info.o82_rid, cfg.o82.rid, cfg.o82.rid_len);
-			info.o82_rid_len = cfg.o82.rid_len;
+			memcpy(info.o82_cid, p->o82.cid, p->o82.cid_len);
+			info.o82_cid_len = p->o82.cid_len;
+			memcpy(info.o82_rid, p->o82.rid, p->o82.rid_len);
+			info.o82_rid_len = p->o82.rid_len;
 		}
-		log_packet(cfg.client_if, ifindex,
+		to[0] = '\0';
+		if (v != VERDICT_DROP &&
+		    xmit_role(p->bridge, ROLE_UPLINK, -1, buf, len,
+			      &st.tx_uplink, to, sizeof(to)) < 0)
+			return -1;
+		log_packet(p->name, ps[port].ifindex,
 			   v == VERDICT_DROP ? "req-drop" :
 			   v == VERDICT_FORWARD_MODIFIED ? "req-mark" : "req-pass",
-			   &info);
-		if (v != VERDICT_DROP && xmit(fd_out, buf, len, &st.tx_uplink) < 0)
-			return -1;
+			   v == VERDICT_DROP ? "-" : to, &info);
 	}
 	return 0;
 }
 
-static int handle_uplink(int fd_in, int fd_out, int ifindex, time_t now,
-			 struct bucket *tb)
+/* client port of this bridge whose option 82 the reply carries, or -1 */
+static int reply_owner(int bridge, const struct dhcp_info *info)
+{
+	int i;
+
+	if (!info->has_o82)
+		return -1;
+	for (i = 0; i < cfg.nport; i++)
+		if (cfg.port[i].bridge == bridge &&
+		    cfg.port[i].role == ROLE_CLIENT &&
+		    dhcp_o82_matches(info, &cfg.port[i].o82))
+			return i;
+	return -1;
+}
+
+static int first_client(int bridge)
+{
+	int i;
+
+	for (i = 0; i < cfg.nport; i++)
+		if (cfg.port[i].bridge == bridge &&
+		    cfg.port[i].role == ROLE_CLIENT)
+			return i;
+	return -1;
+}
+
+static int handle_uplink(int port, time_t now)
 {
 	static uint8_t buf[FRAME_BUF_LEN];
-	struct sockaddr_ll sll;
+	const struct port *p = &cfg.port[port];
 	struct dhcp_info info;
+	char to[128];
 	int i;
 
 	for (i = 0; i < BURST_PER_POLL; i++) {
-		socklen_t sl = sizeof(sll);
-		ssize_t n = recvfrom(fd_in, buf, sizeof(buf), MSG_TRUNC,
-				     (struct sockaddr *)&sll, &sl);
+		ssize_t n = receive(port, buf, sizeof(buf), now,
+				    &st.rep_ratelimited);
 		size_t len;
 		enum verdict v;
 		struct xid_ent *e;
+		int owner, target;
 
 		if (n < 0)
 			return 0;
-		st.rx_uplink++;
-		if (sll.sll_pkttype == PACKET_OUTGOING) {
-			st.rx_outgoing_ignored++;
-			continue;
-		}
-		if ((size_t)n > sizeof(buf)) {
-			st.rx_truncated++;
-			continue;
-		}
-		if (!bucket_take(tb, now)) {
-			st.rep_ratelimited++;
-			continue;
-		}
 		len = (size_t)n;
-		v = dhcp_handle_reply(buf, &len, &cfg.o82, &info);
+		/* which of our client ports does the option 82 belong to? */
+		dhcp_parse(buf, len, &info);
+		owner = reply_owner(p->bridge, &info);
+		v = dhcp_handle_reply(buf, &len, &cfg.port[owner >= 0 ? owner :
+				      first_client(p->bridge)].o82, &info);
 		e = info.reason == R_PARSED || info.reason >= R_REPLY_OURS ?
 			xid_find(info.xid, info.chaddr) : NULL;
+		if (e && cfg.port[e->port].bridge != p->bridge)
+			e = NULL;
+		/* default: the port the request came from, else flood */
+		target = owner >= 0 ? owner : e ? e->port : -1;
 		switch (info.reason) {
 		case R_REPLY_OURS:
 			st.rep_ours++;
@@ -509,14 +605,17 @@ static int handle_uplink(int fd_in, int fd_out, int ifindex, time_t now,
 			e->answered = 1;
 			st.req_answered++;
 		}
+		to[0] = '\0';
+		if (v != VERDICT_DROP &&
+		    xmit_role(p->bridge, ROLE_CLIENT, target, buf, len,
+			      &st.tx_client, to, sizeof(to)) < 0)
+			return -1;
 		/* foreign drops are routine on a shared segment: debug only */
 		if (v != VERDICT_DROP || log_enabled(LOG_LVL_DEBUG))
-			log_packet(cfg.uplink_if, ifindex,
+			log_packet(p->name, ps[port].ifindex,
 				   v == VERDICT_DROP ? "rep-drop" :
 				   v == VERDICT_FORWARD_MODIFIED ? "rep-strip" :
-				   "rep-pass", &info);
-		if (v != VERDICT_DROP && xmit(fd_out, buf, len, &st.tx_client) < 0)
-			return -1;
+				   "rep-pass", v == VERDICT_DROP ? "-" : to, &info);
 	}
 	return 0;
 }
@@ -535,32 +634,36 @@ static void drop_privileges(void)
 static int worker(unsigned restarts)
 {
 	struct sock_fprog preq = BPF(bpf_request), prep = BPF(bpf_reply);
-	struct bucket tb_c = { 0, 0 }, tb_u = { 0, 0 };
-	struct pollfd pfd[2];
-	int fd_c, fd_u, idx_c, idx_u, rc = 0;
+	struct pollfd pfd[MAX_PORTS];
+	int i, rc = 0;
 	time_t started = mono(), t_stats = 0, t_if = 0, t_win;
 	uint32_t win_marked = 0, win_answered = 0;
 
-	fd_c = open_packet(cfg.client_if, ETH_P_IP_, &preq, &idx_c);
-	fd_u = open_packet(cfg.uplink_if, ETH_P_IP_, &prep, &idx_u);
-	if (fd_c < 0 || fd_u < 0)
-		return EXIT_RESTART;
+	for (i = 0; i < cfg.nport; i++) {
+		const struct port *p = &cfg.port[i];
+
+		ps[i].fd = open_packet(p->name, ETH_P_IP_,
+				       p->role == ROLE_CLIENT ? &preq : &prep,
+				       &ps[i].ifindex);
+		if (ps[i].fd < 0)
+			return EXIT_RESTART;
+		ps[i].tb.tokens = cfg.rate_burst;
+		ps[i].tb.last = started;
+		pfd[i].fd = ps[i].fd;
+		pfd[i].events = POLLIN;
+		LOGI("worker: %s %s/%d (on %s) circuit_id=\"%.*s\"",
+		     role_str(p->role), p->name, ps[i].ifindex,
+		     cfg.br[p->bridge].name,
+		     p->role == ROLE_CLIENT ? p->o82.cid_len : 0,
+		     (const char *)p->o82.cid);
+	}
 	stats_fd = open(cfg.stats_file, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
 	drop_privileges();
-
-	tb_c.tokens = tb_u.tokens = cfg.rate_burst;
-	tb_c.last = tb_u.last = started;
 	t_win = started;
-	LOGI("worker running: client %s/%d uplink %s/%d", cfg.client_if,
-	     idx_c, cfg.uplink_if, idx_u);
 
-	pfd[0].fd = fd_c;
-	pfd[0].events = POLLIN;
-	pfd[1].fd = fd_u;
-	pfd[1].events = POLLIN;
 	while (!sig_stop) {
 		time_t now;
-		int n = poll(pfd, 2, 1000);
+		int n = poll(pfd, (nfds_t)cfg.nport, 1000);
 
 		if (n < 0 && errno != EINTR) {
 			LOGE("poll: %s", strerror(errno));
@@ -568,27 +671,34 @@ static int worker(unsigned restarts)
 			break;
 		}
 		now = mono();
-		if (n > 0 && (pfd[0].revents & POLLIN) &&
-		    handle_client(fd_c, fd_u, idx_c, now, &tb_c) < 0) {
-			rc = EXIT_RESTART;
-			break;
+		for (i = 0; n > 0 && i < cfg.nport; i++) {
+			int r = 0;
+
+			if (pfd[i].revents & (POLLERR | POLLNVAL)) {
+				LOGW("socket error on %s", cfg.port[i].name);
+				r = -1;
+			} else if (pfd[i].revents & POLLIN) {
+				r = cfg.port[i].role == ROLE_CLIENT ?
+					handle_client(i, now) :
+					handle_uplink(i, now);
+			}
+			if (r < 0) {
+				rc = EXIT_RESTART;
+				break;
+			}
 		}
-		if (n > 0 && (pfd[1].revents & POLLIN) &&
-		    handle_uplink(fd_u, fd_c, idx_u, now, &tb_u) < 0) {
-			rc = EXIT_RESTART;
+		if (rc)
 			break;
-		}
-		if ((pfd[0].revents | pfd[1].revents) & (POLLERR | POLLNVAL)) {
-			LOGW("socket error, restarting worker");
-			rc = EXIT_RESTART;
-			break;
-		}
 		if (now - t_if >= 10) {
 			t_if = now;
 			xid_expire(now);
-			if ((int)if_nametoindex(cfg.client_if) != idx_c ||
-			    (int)if_nametoindex(cfg.uplink_if) != idx_u) {
-				LOGW("interface index changed, restarting worker");
+			for (i = 0; i < cfg.nport; i++)
+				if ((int)if_nametoindex(cfg.port[i].name) !=
+				    ps[i].ifindex)
+					break;
+			if (i < cfg.nport) {
+				LOGW("interface %s changed, restarting worker",
+				     cfg.port[i].name);
 				rc = EXIT_RESTART;
 				break;
 			}
@@ -779,18 +889,22 @@ static const char *pkttype_str(int t)
 static int diag(unsigned seconds)
 {
 	struct sock_fprog prog = BPF(bpf_any_dhcp);
-	struct diag_sock ds[] = {
-		{ cfg.client_if, ETH_P_ALL_, "ALL", -1, 0 },
-		{ cfg.uplink_if, ETH_P_ALL_, "ALL", -1, 0 },
-		{ cfg.bridge_if, ETH_P_ALL_, "ALL", -1, 0 },
-		{ cfg.client_if, ETH_P_IP_, "IP", -1, 0 },
-		{ cfg.uplink_if, ETH_P_IP_, "IP", -1, 0 },
-	};
-	enum { N = sizeof(ds) / sizeof(ds[0]) };
-	struct pollfd pfd[N];
+	struct diag_sock ds[2 * MAX_PORTS + MAX_BRIDGES];
+	struct pollfd pfd[2 * MAX_PORTS + MAX_BRIDGES];
 	static uint8_t buf[FRAME_BUF_LEN];
 	time_t end = seconds ? mono() + seconds : 0;
-	int i;
+	int i, N = 0;
+
+	/* per port: everything (ALL) and only what broute diverts (IP) */
+	for (i = 0; i < cfg.nport; i++) {
+		ds[N++] = (struct diag_sock){ cfg.port[i].name, ETH_P_ALL_,
+					      "ALL", -1, 0 };
+		ds[N++] = (struct diag_sock){ cfg.port[i].name, ETH_P_IP_,
+					      "IP", -1, 0 };
+	}
+	for (i = 0; i < cfg.nbr; i++)
+		ds[N++] = (struct diag_sock){ cfg.br[i].name, ETH_P_ALL_,
+					      "ALL", -1, 0 };
 
 	for (i = 0; i < N; i++) {
 		ds[i].fd = open_packet(ds[i].ifname, ds[i].proto, &prog,
@@ -807,7 +921,7 @@ static int diag(unsigned seconds)
 	fflush(stdout);
 
 	while (!sig_stop && (!end || mono() < end)) {
-		if (poll(pfd, N, 1000) <= 0)
+		if (poll(pfd, (nfds_t)N, 1000) <= 0)
 			continue;
 		for (i = 0; i < N; i++) {
 			struct sockaddr_ll sll;
@@ -870,23 +984,38 @@ static void usage(void)
 static void print_config(void)
 {
 	char c[256], r[256];
+	int i;
 
 	printf("version         %s\n", VERSION);
-	printf("client_if       %s\n", cfg.client_if);
-	printf("uplink_if       %s\n", cfg.uplink_if);
-	printf("bridge_if       %s\n", cfg.bridge_if);
-	printf("circuit_id      \"%s\" (%s)\n",
-	       id_str(cfg.o82.cid, cfg.o82.cid_len, c, sizeof(c)),
-	       cfg.circuit_id);
-	printf("remote_id       \"%s\" (%s)\n",
-	       id_str(cfg.o82.rid, cfg.o82.rid_len, r, sizeof(r)),
-	       cfg.remote_id);
-	printf("type_mask       0x%x\n", cfg.o82.type_mask);
-	printf("mtu             %u\n", (unsigned)cfg.o82.mtu);
+	printf("hostname        %s\n", cfg.hostname);
+	printf("circuit_id      %s\n", cfg.circuit_id);
+	printf("remote_id       %s\n", cfg.remote_id);
+	for (i = 0; i < cfg.nbr; i++)
+		printf("bridge          %s mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+		       cfg.br[i].name, cfg.br[i].mac[0], cfg.br[i].mac[1],
+		       cfg.br[i].mac[2], cfg.br[i].mac[3], cfg.br[i].mac[4],
+		       cfg.br[i].mac[5]);
+	for (i = 0; i < cfg.nport; i++) {
+		const struct port *p = &cfg.port[i];
+
+		printf("port            %s/%s %s (lower %s)", cfg.br[p->bridge].name,
+		       p->name, role_str(p->role), p->lower);
+		if (p->role == ROLE_CLIENT)
+			printf(" circuit_id=\"%s\" remote_id=\"%s\"",
+			       id_str(p->o82.cid, p->o82.cid_len, c, sizeof(c)),
+			       id_str(p->o82.rid, p->o82.rid_len, r, sizeof(r)));
+		printf("\n");
+	}
+	printf("type_mask       0x%x\n", cfg.type_mask);
+	printf("mtu             %u\n", (unsigned)cfg.mtu);
 	printf("existing_o82    %s\n", cfg.existing_o82 ? "drop" : "forward");
 	printf("reply_foreign   %s\n", cfg.reply_foreign ? "drop" : "forward");
 	printf("reply_no_o82    %s\n", cfg.reply_no_o82 ? "drop" : "forward");
-	printf("rate_limit      %u/s burst %u\n", cfg.rate_pps, cfg.rate_burst);
+	printf("snooping        client_servers=%s uplink_requests=%s\n",
+	       cfg.block_client_servers ? "blocked" : "allowed",
+	       cfg.block_uplink_requests ? "blocked" : "allowed");
+	printf("rate_limit      %u/s burst %u per port\n", cfg.rate_pps,
+	       cfg.rate_burst);
 	printf("auto_rollback   %d (window %us, min %u)\n", cfg.auto_rollback,
 	       cfg.rollback_window, cfg.rollback_min_requests);
 }
@@ -977,12 +1106,24 @@ int main(int argc, char **argv)
 	if (debug)
 		cfg.log_level = LOG_LVL_DEBUG;
 	log_init(cfg.log_level, debug || mode);
+	set_signals();
 	if (config_resolve(&cfg, err, sizeof(err)) < 0) {
 		LOGE("%s", err);
-		return 2;
+		if (mode)
+			return 2;
+		/* started by init: exiting would only make init respawn us
+		 * in a tight loop, so wait for the configuration instead */
+		while (!sig_stop) {
+			struct timespec ts = { 10, 0 };
+
+			nanosleep(&ts, NULL);
+			if (config_resolve(&cfg, err, sizeof(err)) == 0)
+				break;
+		}
+		if (sig_stop)
+			return 0;
 	}
 
-	set_signals();
 	switch (mode) {
 	case 'c':
 		print_config();

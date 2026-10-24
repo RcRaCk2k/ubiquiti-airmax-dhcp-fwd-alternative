@@ -156,7 +156,10 @@ def server(iface, log, seconds, mode="echo"):
             s.send(frame(dst_mac, SERVER_MAC, SERVER_IP, dst_ip, 67, 68, rep))
 
 
-def client(iface, scenario):
+def client(iface, scenario, mac=None):
+    global CLIENT_MAC
+    if mac:
+        CLIENT_MAC = bytes.fromhex(mac.replace(":", ""))
     s = open_sock(iface)
     xid = random.getrandbits(32)
     res = {"xid": xid, "steps": []}
@@ -227,7 +230,7 @@ if __name__ == "__main__":
     if cmd == "server":
         server(*sys.argv[2:6])
     elif cmd == "client":
-        client(*sys.argv[2:4])
+        client(*sys.argv[2:5])
     elif cmd == "send":
         send(*sys.argv[2:4])
     elif cmd == "sniff":

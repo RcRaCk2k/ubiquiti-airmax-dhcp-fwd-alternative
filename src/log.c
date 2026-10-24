@@ -4,10 +4,14 @@
  * Logs go to syslog (busybox syslogd keeps them in RAM) and optionally to
  * stderr. Nothing is ever written to flash.
  */
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <syslog.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "log.h"
 
@@ -18,8 +22,34 @@ static int use_stderr;
 static time_t pkt_window;
 static unsigned pkt_count, pkt_suppressed;
 
+/* uClibc reads /etc/TZ, musl only $TZ: take the airOS zone from there so
+ * syslog timestamps match the rest of the system */
+static void init_tz(void)
+{
+	char buf[64];
+	ssize_t n;
+	int fd;
+
+	if (getenv("TZ"))
+		return;
+	fd = open("/etc/TZ", O_RDONLY);
+	if (fd < 0)
+		return;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return;
+	buf[n] = '\0';
+	buf[strcspn(buf, "\r\n")] = '\0';
+	if (buf[0]) {
+		setenv("TZ", buf, 1);
+		tzset();
+	}
+}
+
 void log_init(int level, int to_stderr)
 {
+	init_tz();
 	cur_level = level;
 	use_stderr = to_stderr;
 	openlog("dhcp-fwd", LOG_PID, LOG_DAEMON);

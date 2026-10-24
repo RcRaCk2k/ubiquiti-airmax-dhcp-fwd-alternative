@@ -319,7 +319,7 @@ enum verdict dhcp_handle_request(uint8_t *f, size_t *len, size_t cap,
 	return VERDICT_FORWARD_MODIFIED;
 }
 
-static int is_ours(const struct dhcp_info *info, const struct o82_cfg *cfg)
+int dhcp_o82_matches(const struct dhcp_info *info, const struct o82_cfg *cfg)
 {
 	if (info->o82_cid_len != cfg->cid_len ||
 	    memcmp(info->o82_cid, cfg->cid, cfg->cid_len))
@@ -359,7 +359,7 @@ enum verdict dhcp_handle_reply(uint8_t *f, size_t *len,
 		return VERDICT_FORWARD;
 	}
 	/* only option 82 in the main field is ours to strip */
-	if (!p.o82_off || !is_ours(info, cfg)) {
+	if (!p.o82_off || !dhcp_o82_matches(info, cfg)) {
 		info->reason = R_REPLY_FOREIGN;
 		return VERDICT_DROP;
 	}

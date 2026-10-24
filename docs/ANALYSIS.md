@@ -78,9 +78,14 @@ zweimal „Neu verbinden“ an der FRITZ!Box:
 ## Architektur dhcp-snooping-82 (Kurzfassung)
 
 * Eigener Agent (MIT), kein Code aus dhcp-fwd.
-* ebtables-**broute** leitet nur DHCP von `eth0` (dport 67) und Serverantworten
-  von `ath0.1284` (sport 67 → dport 68, nicht an die eigene MAC) aus der
-  Bridge aus. Eigene Kette `DHCP_SNOOPING_82` mit Policy `RETURN`, Sprung an
+* Bridges und Ports werden erkannt: jede Bridge mit eingeschaltetem
+  DHCP-Relay in `system.cfg`, ihre Member über `/sys/class/net/<br>/brif`,
+  das physische Interface unter VLANs über `/proc/net/vlan/config`
+  (ersatzweise `iflink`). `eth*` = Kundenport (untrusted), `ath*` = Uplink.
+  Circuit-ID `<hostname>/<bridge>:<port>`, Remote-ID = MAC der Bridge.
+* ebtables-**broute** leitet pro Kundenport DHCP-Requests (dport 67) und pro
+  Uplink Serverantworten (sport 67 → dport 68, nicht an die eigene MAC) aus
+  der Bridge aus. Eigene Kette `DHCP_SNOOPING_82` mit Policy `RETURN`, Sprung an
   Position 1 in `BROUTING`.
 * Empfang über `AF_PACKET`-Sockets mit **`ETH_P_IP`**, gebunden an den
   Bridge-Port, plus BPF. In 2.6.32 erreichen Protokoll-Handler einen Frame nur,

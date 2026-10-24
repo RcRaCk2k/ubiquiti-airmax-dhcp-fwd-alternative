@@ -2,10 +2,20 @@
 
 Transparenter DHCPv4-Option-82-Agent (RFC 3046) für Ubiquiti airOS 8
 (PowerBeam 5AC, WA.v8.7.11). Er ersetzt `/bin/dhcp-fwd` und versieht jedes
-DHCP-Clientpaket, das physisch auf `eth0` ankommt, genau einmal mit
-Circuit-ID (Hostname) und Remote-ID (MAC von `br1`). Das gilt auch für
-Unicast-Renews. Die Bridge bleibt sonst unverändert. Kein L3-Relay: `giaddr`
-bleibt 0.
+DHCP-Clientpaket, das physisch auf einem Ethernet-Port ankommt, genau einmal
+mit Option 82. Das gilt auch für Unicast-Renews. Die Bridge bleibt sonst
+unverändert. Kein L3-Relay: `giaddr` bleibt 0, das setzt der Upstream-Relay.
+
+* **Bridges:** automatisch alle, für die in `/tmp/system.cfg` das DHCP-Relay
+  eingeschaltet ist (`dhcprelay.client.N.devname`).
+* **Ports:** jeder Bridge-Member wird nach dem physischen Interface unter
+  eventuellen VLANs eingeordnet: `eth*` = untrusted Kundenport, `ath*` =
+  Uplink. So funktionieren `eth0`, `eth0.100`, `ath0`, `ath0.1284`, auch
+  mehrere Ethernet-Ports. Andere Member (z. B. `gre0`) bleiben unberührt.
+* **Circuit-ID** `<hostname>/<bridge>:<port>`, z. B. `cust-example/br1:eth0`;
+  **Remote-ID** = MAC der Bridge als Hex-Text. Beides über Templates änderbar.
+* **DHCP-Snooping:** DHCP-Server am Kundenport und Requests fremder Kunden vom
+  Uplink werden verworfen. Die airOS-FIREWALL-Regeln braucht es nicht.
 
 Ist-Analyse und Architektur: [docs/ANALYSIS.md](docs/ANALYSIS.md).
 Lizenz: MIT ([LICENSE](LICENSE)).
@@ -15,7 +25,7 @@ Lizenz: MIT ([LICENSE](LICENSE)).
 ```sh
 make toolchain      # Zig 0.13.0 (clang + musl), SHA256 geprüft, nach .toolchain/
 make                # build/mips/dhcp-fwd: statisch, MIPS32r2 BE, soft-float
-make test           # Unit-Tests (ASan/UBSan, Fuzzing) + tshark-Prüfung
+make test           # Unit-Tests (ASan/UBSan, Fuzzing), tshark-Prüfung, Port-Erkennung
 make integration    # Bridge-Simulation in Netz-Namensräumen, ohne root
 make dist           # build/dist/dhcp-snooping-82-<ver>.tar.gz
 ```
@@ -30,7 +40,7 @@ die SHA256 steht in `build/mips/dhcp-fwd.sha256`.
 scp build/mips/dhcp-fwd scripts/dhcp-snooping-82.sh etc/dhcp-snooping-82.conf root@GERÄT:/tmp/
 # auf dem Gerät
 sh /tmp/dhcp-snooping-82.sh install            # nach /etc/persistent/dhcp-snooping-82, prüft Binary
-/etc/persistent/dhcp-snooping-82/dhcp-fwd --check
+/etc/persistent/dhcp-snooping-82/dhcp-fwd --check     # erkannte Bridges, Ports, IDs
 /etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh diag 120   # passiv, sendet nichts
 /etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh activate   # Health-Check, sonst Rollback
 /etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh status
@@ -82,22 +92,22 @@ ls -l /proc/$(cat /var/run/dhcp-fwd.pid)/fd; cat /proc/net/packet
 Logzeile, Beispiel:
 
 ```
-req-mark if=eth0/2 type=REQUEST xid=0x30336d42 chaddr=1c:ed:6f:00:00:01 src=1c:ed:6f:00:00:01/198.51.100.175
-  dst=dc:9f:db:00:00:01/198.51.100.0 giaddr=0.0.0.0 hops=0 reason=inserted cid="cust-example" rid="00005e005301"
+req-mark if=eth0/2 to=ath0.1284 type=REQUEST xid=0x30336d42 chaddr=1c:ed:6f:00:00:01 src=1c:ed:6f:00:00:01/198.51.100.175
+  dst=dc:9f:db:00:00:01/198.51.100.0 giaddr=0.0.0.0 hops=0 reason=inserted cid="cust-example/br1:eth0" rid="00005e005301"
 ```
 
 ## Verhalten
 
 | Fall | Aktion |
 |---|---|
-| Client-Paket von eth0, ohne Option 82 | Option 82 in den PAD-Bereich, sonst Paket bis MTU vergrößern; einmal auf ath0.1284 senden |
+| Client-Paket von einem Kundenport, ohne Option 82 | Option 82 in den PAD-Bereich, sonst Paket bis MTU vergrößern; einmal auf den Uplink derselben Bridge senden |
 | bereits Option 82 / `giaddr` / `hops` | unverändert weiterleiten (`existing_option82 = forward`) |
 | fehlerhaft, Fragment, falsche Prüfsumme | unverändert weiterleiten, Zähler `req_malformed` |
-| Antwort mit eigener Option 82 | Option 82 entfernen (Länge bleibt, PAD), an eth0 |
+| Antwort mit eigener Option 82 | Option 82 entfernen (Länge bleibt, PAD), nur an den Kundenport, zu dem die Circuit-ID gehört |
 | Antwort mit fremder Option 82 zu einem von uns markierten Request (xid + chaddr) | Upstream hat unsere Option 82 ersetzt: Option 82 entfernen, an eth0 (`rep_foreign_ours_by_xid`) |
 | Antwort mit fremder Option 82, durchgereichter Request | unverändert an eth0 |
 | sonstige Antwort mit fremder Option 82 | verwerfen (andere Station) |
-| Antwort ohne Option 82 | weiterleiten |
+| Antwort ohne Option 82 | an den Port, von dem der Request kam (xid), sonst an alle Kundenports der Bridge |
 | DHCP-Request vom Uplink (Kunden anderer Stationen) | verworfen (Snooping, `block_uplink_requests`) |
 | DHCP-Server-Antwort von eth0 (Server beim Kunden) | verworfen (Snooping, `block_client_servers`) |
 | BOOTREPLY an Port 67 von eth0 / BOOTREQUEST an Port 68 vom Uplink | verworfen |

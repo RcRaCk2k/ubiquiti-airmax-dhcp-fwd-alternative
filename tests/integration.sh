@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: MIT
 # Namespace integration test, no root needed (user + network namespaces).
 #
-#   client ns: c0 ---veth--- eth0 [br1 + agent] ath0.1284 ---veth--- s0 :server ns
+#   client ns:  c0 ---veth--- eth0 \
+#                                   [br1 + agent] ath0.1284 (VLAN on ath0) ---veth--- s0 / s0.1284 :server ns
+#   client2 ns: c1 ---veth--- eth1 /
+#
+# Bridge and ports are detected automatically from system.cfg and sysfs.
 #
 # The airOS broute rules are emulated with nft "meta broute", which has the
 # same effect on a modern kernel: the frame is not bridged but continues on
@@ -11,7 +15,7 @@
 set -eu
 
 if [ "${DS82_IN_NS:-}" != 1 ]; then
-	exec unshare -rn --kill-child env DS82_IN_NS=1 sh "$0" "$@"
+	exec unshare -rnm --kill-child env DS82_IN_NS=1 sh "$0" "$@"
 fi
 
 top=$(cd "$(dirname "$0")/.." && pwd)
@@ -23,9 +27,13 @@ fail=0
 
 cleanup() {
 	[ -n "${AGENT:-}" ] && kill "$AGENT" 2>/dev/null
-	kill "$CNS" "$SNS" 2>/dev/null
-	wait 2>/dev/null
-	if [ "$fail" = 0 ]; then rm -rf "$W"; else echo "logs kept in $W"; fi
+	kill "$CNS" "$CNS2" "$SNS" 2>/dev/null
+	if [ "$fail" = 0 ]; then
+		rm -rf "$W"
+	else
+		echo "--- agent.log (tail)"; tail -20 "$W/agent.log" 2>/dev/null
+		echo "logs kept in $W"
+	fi
 }
 trap cleanup EXIT
 
@@ -34,26 +42,36 @@ bad()  { echo "  FAIL $*"; fail=1; }
 expect() { if [ "$1" = "$2" ]; then ok "$3 ($1)"; else bad "$3: got '$1' want '$2'"; fi; }
 
 # --- topology -------------------------------------------------------
+# own sysfs, so /sys/class/net shows this namespace (auto detection)
+mount -t sysfs sysfs /sys
 unshare -n sleep 3600 & CNS=$!
+unshare -n sleep 3600 & CNS2=$!
 unshare -n sleep 3600 & SNS=$!
 sleep 0.3
-inc() { nsenter -t "$CNS" -n "$@"; }
-ins() { nsenter -t "$SNS" -n "$@"; }
+inc()  { nsenter -t "$CNS" -n "$@"; }
+inc2() { nsenter -t "$CNS2" -n "$@"; }
+ins()  { nsenter -t "$SNS" -n "$@"; }
 
 ip link set lo up
 ip link add eth0 type veth peer name c0
-ip link add ath0.1284 type veth peer name s0
+ip link add eth1 type veth peer name c1
+ip link add ath0 type veth peer name s0
+ip link add link ath0 name ath0.1284 type vlan id 1284
 ip link set c0 netns "$CNS"
+ip link set c1 netns "$CNS2"
 ip link set s0 netns "$SNS"
 ip link add br1 type bridge
 ip link set br1 address $BRMAC
-ip link set eth0 master br1
-ip link set ath0.1284 master br1
-for i in eth0 ath0.1284 br1; do ip link set "$i" up; done
+for i in eth0 eth1 ath0.1284; do ip link set "$i" master br1; done
+for i in eth0 eth1 ath0 ath0.1284 br1; do ip link set "$i" up; done
 inc ip link set c0 address 02:11:22:33:44:55
 inc ip link set c0 up
+inc2 ip link set c1 address 02:11:22:33:44:66
+inc2 ip link set c1 up
 ins ip link set s0 address 02:aa:bb:cc:dd:ee
 ins ip link set s0 up
+ins ip link add link s0 name s0.1284 type vlan id 1284
+ins ip link set s0.1284 up
 sleep 1
 
 broute_on() {
@@ -61,9 +79,9 @@ broute_on() {
 table bridge ds82 {
 	chain brouting {
 		type filter hook prerouting priority -300;
-		iifname "eth0" ip protocol udp udp dport 67 meta broute set 1
+		iifname { "eth0", "eth1" } ip protocol udp udp dport 67 meta broute set 1
+		iifname { "eth0", "eth1" } ip protocol udp udp sport 67 udp dport 68 meta broute set 1
 		iifname "ath0.1284" ether daddr != $BRMAC ip protocol udp udp sport 67 udp dport 68 meta broute set 1
-		iifname "eth0" ip protocol udp udp sport 67 udp dport 68 meta broute set 1
 		iifname "ath0.1284" ip protocol udp udp dport 67 meta broute set 1
 	}
 }
@@ -76,20 +94,18 @@ cat > "$W/ebtables" <<'EOF'
 #!/bin/sh
 case "$*" in
 *"-L BROUTING"*) echo "Bridge chain: BROUTING, entries: 1, policy: ACCEPT"; echo "-j DHCP_SNOOPING_82 " ;;
-*"-L DHCP_SNOOPING_82"*) echo "Bridge chain: DHCP_SNOOPING_82, entries: 4, policy: RETURN"; for i in 1 2 3 4; do echo "-j DROP "; done ;;
+*"-L DHCP_SNOOPING_82"*) echo "Bridge chain: DHCP_SNOOPING_82, entries: 6, policy: RETURN"; for i in 1 2 3 4 5 6; do echo "-j DROP "; done ;;
 esac
 exit 0
 EOF
 chmod +x "$W/ebtables"
-echo "resolv.host.1.name=cust-example" > "$W/system.cfg"
+cat > "$W/system.cfg" <<'EOF'
+resolv.host.1.name=cust-example
+dhcprelay.status=enabled
+dhcprelay.client.1.devname=br1
+dhcprelay.client.1.status=enabled
+EOF
 cat > "$W/agent.conf" <<EOF
-[interface]
-client = eth0
-uplink = ath0.1284
-bridge = br1
-[option82]
-circuit_id = hostname
-remote_id = bridge-mac
 [forwarding]
 ebtables = $W/ebtables
 [logging]
@@ -115,7 +131,7 @@ count() { grep -c "$1" "$2" 2>/dev/null || true; }
 echo "1) DISCOVER/REQUEST/RENEW/REBIND through agent"
 broute_on
 start_agent
-ins $SIM server s0 "$W/server1.log" 14 &
+ins $SIM server s0.1284 "$W/server1.log" 14 &
 SRV=$!
 sleep 0.5
 inc $SIM client c0 full > "$W/client1.json"
@@ -133,8 +149,7 @@ def check(cond, msg):
     ok &= cond
 check(len(mine) == 4, "server got exactly 4 requests (%d)" % len(mine))
 for p in mine:
-    check(p["o82"] == {1: "cust-example", 2: "00005e005301"} or
-          p["o82"] == {"1": "cust-example", "2": "00005e005301"},
+    check(p["o82"] == {"1": "cust-example/br1:eth0", "2": "00005e005301"},
           "type %d has our option 82: %s" % (p["type"], p["o82"]))
     check(p["giaddr"] == "0.0.0.0", "giaddr untouched")
     check(p["udp_csum_ok"], "udp checksum valid")
@@ -152,19 +167,19 @@ EOF
 
 # --- 2: uplink broadcast must not be marked again --------------------
 echo "2) foreign DISCOVER from uplink: not re-marked, not passed to customer"
-ins $SIM sniff s0 "$W/server2.log" 3 &
+ins $SIM sniff s0.1284 "$W/server2.log" 3 &
 SN1=$!
 inc $SIM sniff c0 "$W/client2.log" 3 &
 SN2=$!
 sleep 0.5
-ins $SIM send s0 foreign-discover
+ins $SIM send s0.1284 foreign-discover
 wait $SN1 $SN2
 expect "$(count f0f0f0f0 "$W/server2.log")" 0 "no copy sent back to the uplink"
 expect "$(grep -c '"xid": 4042322160' "$W/server2.log" || true)" 0 "no duplicate on uplink"
 expect "$(grep -c '"xid": 4042322160' "$W/client2.log" || true)" 0 "snooping: other customer's request blocked"
 
 echo "2b) DHCP server on the customer side is blocked"
-ins $SIM sniff s0 "$W/server2b.log" 3 &
+ins $SIM sniff s0.1284 "$W/server2b.log" 3 &
 SN=$!
 sleep 0.5
 inc $SIM send c0 rogue-offer
@@ -176,13 +191,13 @@ echo "3) OFFER with foreign option 82 does not reach the client"
 inc $SIM sniff c0 "$W/client3.log" 3 &
 SN=$!
 sleep 0.5
-ins $SIM send s0 foreign-offer
+ins $SIM send s0.1284 foreign-offer
 wait $SN
 expect "$(grep -c '"xid": 2882400001' "$W/client3.log" || true)" 0 "foreign offer filtered"
 
 # --- 3b: upstream replaced our option 82 in the reply ---------------
 echo "3b) reply carries upstream option 82 instead of ours"
-ins $SIM server s0 "$W/server3b.log" 6 replace &
+ins $SIM server s0.1284 "$W/server3b.log" 6 replace &
 SRV=$!
 sleep 0.5
 inc $SIM client c0 discover > "$W/client3b.json"
@@ -197,12 +212,40 @@ PY
 sleep 1.5
 expect "$(sed -n 's/^rep_foreign_ours_by_xid //p' "$W/stats")" 1 "counted as rep_foreign_ours_by_xid"
 
+# --- 3c: second customer port --------------------------------------
+echo "3c) second client port eth1: own circuit id, reply only to eth1"
+ins $SIM server s0.1284 "$W/server3c.log" 6 &
+SRV=$!
+inc $SIM sniff c0 "$W/client3c-other.log" 5 &
+SN=$!
+sleep 0.5
+inc2 $SIM client c1 discover 02:11:22:33:44:66 > "$W/client3c.json"
+wait $SRV $SN
+python3 -I - "$W/client3c.json" "$W/server3c.log" "$W/client3c-other.log" <<'PY' || fail=1
+import json, sys
+cl = json.load(open(sys.argv[1]))
+srv = [json.loads(l) for l in open(sys.argv[2])]
+other = [json.loads(l) for l in open(sys.argv[3])]
+mine = [p for p in srv if p["xid"] == cl["xid"]]
+ok = True
+def check(cond, msg):
+    global ok
+    print(("  ok   " if cond else "  FAIL ") + msg)
+    ok &= cond
+check(len(mine) == 1 and mine[0]["o82"] == {"1": "cust-example/br1:eth1", "2": "00005e005301"},
+      "server got one DISCOVER with circuit id .../br1:eth1")
+r = cl["steps"][0]["reply"]
+check(r is not None and r["o82"] is None, "OFFER reaches eth1 without option 82")
+check(not [p for p in other if p["xid"] == cl["xid"]], "OFFER not sent to eth0")
+sys.exit(0 if ok else 1)
+PY
+
 stop_agent
-grep -E "^(req_inserted|rep_ours|rep_foreign_dropped|tx_error) " "$W/stats" | sed 's/^/  stat /'
+grep -E "^(port|req_inserted|rep_ours|rep_foreign_dropped|tx_error) " "$W/stats" | sed 's/^/  stat /'
 
 # --- 4: rules present but agent dead: fail closed -------------------
 echo "4) agent stopped, rules kept: DHCP blocked (fail closed)"
-ins $SIM sniff s0 "$W/server4.log" 3 &
+ins $SIM sniff s0.1284 "$W/server4.log" 3 &
 SN=$!
 sleep 0.5
 inc $SIM client c0 discover > /dev/null
@@ -213,7 +256,7 @@ expect "$(grep -c '"op": 1' "$W/server4.log" || true)" 0 "nothing leaks without 
 echo "5) agent running, no broute rules: bridge forwards exactly once"
 broute_off
 start_agent
-ins $SIM sniff s0 "$W/server5.log" 3 &
+ins $SIM sniff s0.1284 "$W/server5.log" 3 &
 SN=$!
 sleep 0.5
 inc $SIM client c0 discover > /dev/null

@@ -105,24 +105,80 @@ static int run(const struct config *c, char *const argv[], char *out,
 		rc = run(c, a_, NULL, 0);				\
 	} while (0)
 
-static void own_mac(const struct config *c, char *buf, size_t n)
-{
-	uint8_t m[6];
+static int jump_count(const struct config *c);
 
-	if (config_get_mac(c->bridge_if, m) < 0)
-		memset(m, 0, sizeof(m));
-	snprintf(buf, n, "%02x:%02x:%02x:%02x:%02x:%02x",
-		 m[0], m[1], m[2], m[3], m[4], m[5]);
+static int add_rule(const struct config *c, const char *ifname,
+		    const char *notdst, const char *sport, const char *dport)
+{
+	char *a[24];
+	int n = 0;
+
+	a[n++] = (char *)"ebtables";
+	a[n++] = (char *)"-t";
+	a[n++] = (char *)"broute";
+	a[n++] = (char *)"-A";
+	a[n++] = (char *)EBT_CHAIN;
+	a[n++] = (char *)"-p";
+	a[n++] = (char *)"IPv4";
+	a[n++] = (char *)"-i";
+	a[n++] = (char *)ifname;
+	if (notdst) {
+		a[n++] = (char *)"-d";
+		a[n++] = (char *)"!";
+		a[n++] = (char *)notdst;
+	}
+	a[n++] = (char *)"--ip-proto";
+	a[n++] = (char *)"udp";
+	if (sport) {
+		a[n++] = (char *)"--ip-sport";
+		a[n++] = (char *)sport;
+	}
+	a[n++] = (char *)"--ip-dport";
+	a[n++] = (char *)dport;
+	a[n++] = (char *)"-j";
+	a[n++] = (char *)"DROP";
+	a[n] = NULL;
+	return run(c, a, NULL, 0);
 }
 
-static int jump_count(const struct config *c);
+/* rules per port; must match expected_rules() */
+static int add_port_rules(const struct config *c, const struct port *p)
+{
+	char mac[18];
+	const uint8_t *m = c->br[p->bridge].mac;
+	int rc;
+
+	if (p->role == ROLE_CLIENT) {
+		/* client requests (also unicast renews) to the agent */
+		rc = add_rule(c, p->name, NULL, NULL, "67");
+		/* snooping: DHCP server behind the customer port */
+		if (!rc && c->block_client_servers)
+			rc = add_rule(c, p->name, NULL, "67", "68");
+		return rc;
+	}
+	snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+		 m[0], m[1], m[2], m[3], m[4], m[5]);
+	/* server replies, except those for the station itself */
+	rc = add_rule(c, p->name, mac, "67", "68");
+	/* snooping: requests of other customers */
+	if (!rc && c->block_uplink_requests)
+		rc = add_rule(c, p->name, NULL, NULL, "67");
+	return rc;
+}
+
+static int expected_rules(const struct config *c)
+{
+	int i, n = 0;
+
+	for (i = 0; i < c->nport; i++)
+		n += 1 + (c->port[i].role == ROLE_CLIENT ?
+			  !!c->block_client_servers : !!c->block_uplink_requests);
+	return n;
+}
 
 int ebt_install(const struct config *c)
 {
-	char mac[18];
-	int rc;
-
-	own_mac(c, mac, sizeof(mac));
+	int rc, i;
 
 	/* user chain with policy RETURN: a user chain defaults to ACCEPT,
 	 * which in broute would end BROUTING early and skip airOS' own
@@ -134,35 +190,10 @@ int ebt_install(const struct config *c)
 	EBT((char *)"-F", (char *)EBT_CHAIN);
 	if (rc != 0)
 		goto fail;
-	EBT((char *)"-A", (char *)EBT_CHAIN, (char *)"-p", (char *)"IPv4",
-	    (char *)"-i", (char *)c->client_if,
-	    (char *)"--ip-proto", (char *)"udp",
-	    (char *)"--ip-dport", (char *)"67", (char *)"-j", (char *)"DROP");
-	if (rc != 0)
-		goto fail;
-	EBT((char *)"-A", (char *)EBT_CHAIN, (char *)"-p", (char *)"IPv4",
-	    (char *)"-i", (char *)c->uplink_if, (char *)"-d", (char *)"!", mac,
-	    (char *)"--ip-proto", (char *)"udp",
-	    (char *)"--ip-sport", (char *)"67",
-	    (char *)"--ip-dport", (char *)"68", (char *)"-j", (char *)"DROP");
-	if (rc != 0)
-		goto fail;
-	/* DHCP snooping: diverted frames nobody listens for are discarded
-	 * by the IP stack of the port (no address there) */
-	if (c->block_client_servers) {
-		EBT((char *)"-A", (char *)EBT_CHAIN, (char *)"-p", (char *)"IPv4",
-		    (char *)"-i", (char *)c->client_if,
-		    (char *)"--ip-proto", (char *)"udp",
-		    (char *)"--ip-sport", (char *)"67",
-		    (char *)"--ip-dport", (char *)"68", (char *)"-j", (char *)"DROP");
-		if (rc != 0)
-			goto fail;
-	}
-	if (c->block_uplink_requests) {
-		EBT((char *)"-A", (char *)EBT_CHAIN, (char *)"-p", (char *)"IPv4",
-		    (char *)"-i", (char *)c->uplink_if,
-		    (char *)"--ip-proto", (char *)"udp",
-		    (char *)"--ip-dport", (char *)"67", (char *)"-j", (char *)"DROP");
+	/* diverted frames nobody listens for are discarded by the IP stack
+	 * of the port (no address there): that is the snooping drop */
+	for (i = 0; i < c->nport; i++) {
+		rc = add_port_rules(c, &c->port[i]);
 		if (rc != 0)
 			goto fail;
 	}
@@ -184,7 +215,8 @@ int ebt_install(const struct config *c)
 	}
 	if (ebt_check(c) != 1)
 		goto fail;
-	LOGI("broute rules installed (chain %s)", EBT_CHAIN);
+	LOGI("broute rules installed (chain %s, %d rules)", EBT_CHAIN,
+	     expected_rules(c));
 	return 0;
 fail:
 	LOGE("installing broute rules failed (ebtables rc=%d)", rc);
@@ -221,7 +253,7 @@ int ebt_check(const struct config *c)
 	char *const lc[] = { (char *)"ebtables", (char *)"-t", (char *)"broute",
 			     (char *)"-L", (char *)EBT_CHAIN, NULL };
 	char *buf = list_buf, want[48];
-	int rc, n = 2 + !!c->block_client_servers + !!c->block_uplink_requests;
+	int rc, n = expected_rules(c);
 
 	rc = jump_count(c);
 	if (rc < 0)

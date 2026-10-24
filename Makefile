@@ -48,8 +48,9 @@ $(BUILD)/test_dhcp: tests/test_dhcp.c src/dhcp.c src/dhcp.h
 	$(CC) -O1 -g -fsanitize=address,undefined $(WARN) $(DEFS) -Isrc \
 		-o $@ tests/test_dhcp.c src/dhcp.c
 
-test: $(BUILD)/test_dhcp
+test: $(BUILD)/test_dhcp host
 	cd $(BUILD) && ./test_dhcp
+	sh tests/test_detect.sh
 	@if command -v tshark >/dev/null; then sh tests/check_pcap.sh $(BUILD)/test_out.pcap; fi
 
 toolchain:

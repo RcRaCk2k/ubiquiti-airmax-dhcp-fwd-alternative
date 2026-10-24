@@ -6,13 +6,12 @@
  *   key = value      # comment
  */
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
@@ -48,15 +47,17 @@ static int read_file(const char *path, char *buf, size_t n)
 void config_defaults(struct config *c)
 {
 	memset(c, 0, sizeof(*c));
-	copy(c->client_if, sizeof(c->client_if), "eth0");
-	copy(c->uplink_if, sizeof(c->uplink_if), "ath0.1284");
-	copy(c->bridge_if, sizeof(c->bridge_if), "br1");
-	copy(c->circuit_id, sizeof(c->circuit_id), "hostname");
-	copy(c->remote_id, sizeof(c->remote_id), "bridge-mac");
-	c->o82.mtu = 1500;
-	c->o82.type_mask = TYPE_BIT(0) | TYPE_BIT(DHCP_DISCOVER) |
-			   TYPE_BIT(DHCP_REQUEST) | TYPE_BIT(DHCP_DECLINE) |
-			   TYPE_BIT(DHCP_RELEASE) | TYPE_BIT(DHCP_INFORM);
+	copy(c->bridges_spec, sizeof(c->bridges_spec), "auto");
+	copy(c->clients_spec, sizeof(c->clients_spec), "auto");
+	copy(c->uplinks_spec, sizeof(c->uplinks_spec), "auto");
+	copy(c->client_prefix, sizeof(c->client_prefix), "eth");
+	copy(c->uplink_prefix, sizeof(c->uplink_prefix), "ath");
+	copy(c->circuit_id, sizeof(c->circuit_id), "%h/%b:%p");
+	copy(c->remote_id, sizeof(c->remote_id), "%m");
+	c->mtu = 1500;
+	c->type_mask = TYPE_BIT(0) | TYPE_BIT(DHCP_DISCOVER) |
+		       TYPE_BIT(DHCP_REQUEST) | TYPE_BIT(DHCP_DECLINE) |
+		       TYPE_BIT(DHCP_RELEASE) | TYPE_BIT(DHCP_INFORM);
 	c->existing_o82 = POL_FORWARD;
 	c->reply_foreign = POL_DROP;
 	c->reply_no_o82 = POL_FORWARD;
@@ -175,17 +176,21 @@ static int set_key(struct config *c, const char *sec, const char *key,
 	unsigned u;
 	int r;
 
-	if (KEY("interface", "client"))
-		return STR(c->client_if);
-	if (KEY("interface", "uplink"))
-		return STR(c->uplink_if);
-	if (KEY("interface", "bridge"))
-		return STR(c->bridge_if);
+	if (KEY("interface", "bridges"))
+		return STR(c->bridges_spec);
+	if (KEY("interface", "clients"))
+		return STR(c->clients_spec);
+	if (KEY("interface", "uplinks"))
+		return STR(c->uplinks_spec);
+	if (KEY("interface", "client_prefix"))
+		return STR(c->client_prefix);
+	if (KEY("interface", "uplink_prefix"))
+		return STR(c->uplink_prefix);
 	if (KEY("interface", "mtu")) {
 		r = parse_uint(val, &u, 1500);
 		if (r || u < 576)
 			return -1;
-		c->o82.mtu = u;
+		c->mtu = u;
 		return 0;
 	}
 	if (KEY("option82", "circuit_id"))
@@ -193,7 +198,7 @@ static int set_key(struct config *c, const char *sec, const char *key,
 	if (KEY("option82", "remote_id"))
 		return STR(c->remote_id);
 	if (KEY("option82", "types"))
-		return parse_types(val, &c->o82.type_mask);
+		return parse_types(val, &c->type_mask);
 	if (KEY("option82", "existing_option82"))
 		return parse_policy(val, &c->existing_o82);
 	if (KEY("reply", "foreign_option82"))
@@ -236,6 +241,8 @@ static int set_key(struct config *c, const char *sec, const char *key,
 		return STR(c->pidfile);
 	if (KEY("system", "system_cfg"))
 		return STR(c->system_cfg);
+	if (KEY("system", "root"))
+		return STR(c->root);
 	if (KEY("system", "worker_uid"))
 		return parse_uint(val, &c->worker_uid, 65535);
 	if (KEY("system", "worker_gid"))
@@ -327,21 +334,150 @@ int config_is_ours(const char *path)
 	return 0;
 }
 
-int config_get_mac(const char *ifname, uint8_t mac[6])
+const char *role_str(int role)
 {
-	struct ifreq ifr;
-	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	return role == ROLE_CLIENT ? "client" :
+	       role == ROLE_UPLINK ? "uplink" : "none";
+}
 
-	if (fd < 0)
+static int sys_read(const struct config *c, const char *path, char *buf,
+		    size_t n)
+{
+	char full[256];
+
+	snprintf(full, sizeof(full), "%s%s", c->root, path);
+	return read_file(full, buf, n);
+}
+
+static int read_mac(const struct config *c, const char *ifname, uint8_t mac[6])
+{
+	char path[96], buf[32];
+	unsigned m[6];
+	int i;
+
+	snprintf(path, sizeof(path), "/sys/class/net/%s/address", ifname);
+	if (sys_read(c, path, buf, sizeof(buf)) < 17 ||
+	    sscanf(buf, "%x:%x:%x:%x:%x:%x", &m[0], &m[1], &m[2], &m[3],
+		   &m[4], &m[5]) != 6)
 		return -1;
-	memset(&ifr, 0, sizeof(ifr));
-	copy(ifr.ifr_name, sizeof(ifr.ifr_name), ifname);
-	if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
-		close(fd);
+	for (i = 0; i < 6; i++)
+		mac[i] = (uint8_t)m[i];
+	return 0;
+}
+
+static int read_int(const struct config *c, const char *ifname,
+		    const char *attr)
+{
+	char path[96], buf[16];
+
+	snprintf(path, sizeof(path), "/sys/class/net/%s/%s", ifname, attr);
+	if (sys_read(c, path, buf, sizeof(buf)) <= 0)
+		return -1;
+	return atoi(buf);
+}
+
+/* name of the interface with the given ifindex, via sysfs */
+static int name_by_index(const struct config *c, int idx, char *out)
+{
+	char path[256];
+	struct dirent *d;
+	DIR *dir;
+	int found = -1;
+
+	snprintf(path, sizeof(path), "%s/sys/class/net", c->root);
+	dir = opendir(path);
+	if (!dir)
+		return -1;
+	while ((d = readdir(dir))) {
+		if (d->d_name[0] == '.')
+			continue;
+		if (read_int(c, d->d_name, "ifindex") == idx) {
+			copy(out, IFNAMSIZ, d->d_name);
+			found = 0;
+			break;
+		}
+	}
+	closedir(dir);
+	return found;
+}
+
+/* VLAN device -> underlying device: /proc/net/vlan/config, else iflink */
+static int vlan_lower(const struct config *c, const char *ifname, char *out)
+{
+	static char buf[4096];
+	char *line, *next;
+	int idx, link;
+
+	if (sys_read(c, "/proc/net/vlan/config", buf, sizeof(buf)) > 0) {
+		for (line = buf; line; line = next) {
+			char name[IFNAMSIZ + 1], lower[IFNAMSIZ + 1];
+			unsigned vid;
+
+			next = strchr(line, '\n');
+			if (next)
+				*next++ = '\0';
+			if (sscanf(line, "%16s | %u | %16s", name, &vid, lower) == 3 &&
+			    !strcmp(name, ifname)) {
+				copy(out, IFNAMSIZ, lower);
+				return 0;
+			}
+		}
 		return -1;
 	}
-	close(fd);
-	memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+	/* no vlan proc file (e.g. inside a namespace): VLAN names contain
+	 * a dot; iflink is the ifindex of the lower device */
+	if (!strchr(ifname, '.'))
+		return -1;
+	idx = read_int(c, ifname, "ifindex");
+	link = read_int(c, ifname, "iflink");
+	if (idx < 0 || link <= 0 || link == idx)
+		return -1;
+	return name_by_index(c, link, out);
+}
+
+static void resolve_lower(const struct config *c, const char *ifname,
+			  char *out)
+{
+	char cur[IFNAMSIZ], next[IFNAMSIZ];
+	int depth;
+
+	copy(cur, sizeof(cur), ifname);
+	for (depth = 0; depth < 4 && vlan_lower(c, cur, next) == 0; depth++)
+		copy(cur, sizeof(cur), next);
+	copy(out, IFNAMSIZ, cur);
+}
+
+/* is word in the comma/space separated list? */
+static int in_list(const char *list, const char *word)
+{
+	size_t l = strlen(word);
+	const char *p = list;
+
+	while (*p) {
+		size_t n;
+
+		p += strspn(p, ", ");
+		n = strcspn(p, ", ");
+		if (n == l && !strncmp(p, word, l))
+			return 1;
+		p += n;
+	}
+	return 0;
+}
+
+static int has_prefix(const char *list, const char *name)
+{
+	const char *p = list;
+
+	while (*p) {
+		size_t n;
+
+		p += strspn(p, ", ");
+		n = strcspn(p, ", ");
+		if (n && !strncmp(p, name, n))
+			return 1;
+		p += n;
+	}
 	return 0;
 }
 
@@ -380,73 +516,274 @@ static int system_hostname(const char *syscfg, char *out, size_t n)
 	return -1;
 }
 
-/* "hostname" | "<ifname>-mac" | "bridge-mac" | "string:<literal>" | literal */
-static int resolve_id(struct config *c, const char *spec, uint8_t *out,
-		      uint8_t *outlen, char *err, size_t errlen)
+/* value of key=... in system.cfg, "" if missing */
+static const char *syscfg_get(const char *buf, const char *key, char *out,
+			      size_t n)
 {
-	char tmp[256];
-	size_t l;
+	size_t kl = strlen(key);
+	const char *p = buf;
 
-	if (!strcmp(spec, "hostname")) {
-		if (system_hostname(c->system_cfg, tmp, sizeof(tmp)) < 0) {
-			snprintf(err, errlen, "cannot determine hostname");
-			return -1;
-		}
-	} else if ((l = strlen(spec)) > 4 && !strcmp(spec + l - 4, "-mac")) {
-		char ifn[IFNAMSIZ];
-		uint8_t mac[6];
+	out[0] = '\0';
+	while (p && *p) {
+		if (!strncmp(p, key, kl) && p[kl] == '=') {
+			size_t l = strcspn(p + kl + 1, "\r\n");
 
-		if (!strcmp(spec, "bridge-mac"))
-			copy(ifn, sizeof(ifn), c->bridge_if);
-		else if (l - 4 < sizeof(ifn)) {
-			memcpy(ifn, spec, l - 4);
-			ifn[l - 4] = '\0';
-		} else {
-			snprintf(err, errlen, "bad interface in %s", spec);
-			return -1;
+			if (l >= n)
+				l = n - 1;
+			memcpy(out, p + kl + 1, l);
+			out[l] = '\0';
+			break;
 		}
-		if (config_get_mac(ifn, mac) < 0) {
-			snprintf(err, errlen, "cannot read MAC of %s", ifn);
-			return -1;
-		}
-		snprintf(tmp, sizeof(tmp), "%02x%02x%02x%02x%02x%02x",
-			 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-	} else if (!strncmp(spec, "string:", 7)) {
-		copy(tmp, sizeof(tmp), spec + 7);
-	} else {
-		copy(tmp, sizeof(tmp), spec);
+		p = strchr(p, '\n');
+		if (p)
+			p++;
 	}
+	return out;
+}
 
-	l = strlen(tmp);
-	if (l > 250) {
-		snprintf(err, errlen, "id too long: %s", tmp);
+static int add_bridge(struct config *c, const char *name)
+{
+	int i;
+
+	for (i = 0; i < c->nbr; i++)
+		if (!strcmp(c->br[i].name, name))
+			return 0;
+	if (c->nbr == MAX_BRIDGES)
+		return -1;
+	copy(c->br[c->nbr].name, IFNAMSIZ, name);
+	c->nbr++;
+	return 0;
+}
+
+/* bridges with DHCP relay (option 82) enabled in airOS:
+ *   dhcprelay.status=enabled
+ *   dhcprelay.client.N.devname=br1 / dhcprelay.client.N.status=enabled */
+static int detect_bridges(struct config *c, char *err, size_t errlen)
+{
+	static char buf[32768];
+	char key[64], val[64];
+	int i;
+
+	if (read_file(c->system_cfg, buf, sizeof(buf)) < 0) {
+		snprintf(err, errlen, "%s: %s", c->system_cfg, strerror(errno));
 		return -1;
 	}
-	memcpy(out, tmp, l);
-	*outlen = (uint8_t)l;
+	if (strcmp(syscfg_get(buf, "dhcprelay.status", val, sizeof(val)),
+		   "enabled")) {
+		snprintf(err, errlen, "DHCP relay not enabled in %s",
+			 c->system_cfg);
+		return -1;
+	}
+	for (i = 1; i <= 16; i++) {
+		char dev[IFNAMSIZ];
+
+		snprintf(key, sizeof(key), "dhcprelay.client.%d.devname", i);
+		syscfg_get(buf, key, dev, sizeof(dev));
+		if (!dev[0])
+			continue;
+		snprintf(key, sizeof(key), "dhcprelay.client.%d.status", i);
+		if (strcmp(syscfg_get(buf, key, val, sizeof(val)), "enabled"))
+			continue;
+		if (add_bridge(c, dev) < 0) {
+			snprintf(err, errlen, "too many bridges");
+			return -1;
+		}
+	}
+	if (!c->nbr) {
+		snprintf(err, errlen, "no bridge with DHCP relay enabled in %s",
+			 c->system_cfg);
+		return -1;
+	}
+	return 0;
+}
+
+static int bridges_from_list(struct config *c, char *err, size_t errlen)
+{
+	char buf[128], *tok, *save = NULL;
+
+	copy(buf, sizeof(buf), c->bridges_spec);
+	for (tok = strtok_r(buf, ", ", &save); tok;
+	     tok = strtok_r(NULL, ", ", &save))
+		if (add_bridge(c, tok) < 0) {
+			snprintf(err, errlen, "too many bridges");
+			return -1;
+		}
+	return 0;
+}
+
+static void hex_mac(const uint8_t *m, char *out)
+{
+	sprintf(out, "%02x%02x%02x%02x%02x%02x",
+		m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+static int expand(const struct config *c, const char *tpl,
+		  const struct port *p, uint8_t *out, uint8_t *outlen)
+{
+	char buf[256], mac[13];
+	size_t o = 0;
+	const char *s;
+
+	for (s = tpl; *s; s++) {
+		const char *ins = NULL;
+		uint8_t pm[6];
+
+		if (*s != '%') {
+			if (o + 1 >= sizeof(buf))
+				return -1;
+			buf[o++] = *s;
+			continue;
+		}
+		switch (*++s) {
+		case 'h': ins = c->hostname; break;
+		case 'b': ins = c->br[p->bridge].name; break;
+		case 'p': ins = p->name; break;
+		case 'm': hex_mac(c->br[p->bridge].mac, mac); ins = mac; break;
+		case 'M':
+			if (read_mac(c, p->name, pm) < 0)
+				return -1;
+			hex_mac(pm, mac);
+			ins = mac;
+			break;
+		case '%': ins = "%"; break;
+		default: return -1;
+		}
+		if (o + strlen(ins) >= sizeof(buf))
+			return -1;
+		memcpy(buf + o, ins, strlen(ins));
+		o += strlen(ins);
+	}
+	if (o > 250)
+		return -1;
+	memcpy(out, buf, o);
+	*outlen = (uint8_t)o;
+	return 0;
+}
+
+static int scan_bridge(struct config *c, int b, char *err, size_t errlen)
+{
+	char path[256];
+	struct dirent *d;
+	DIR *dir;
+	int clients = 0, uplinks = 0, first = c->nport;
+
+	if (read_mac(c, c->br[b].name, c->br[b].mac) < 0) {
+		snprintf(err, errlen, "bridge %s not found", c->br[b].name);
+		return -1;
+	}
+	snprintf(path, sizeof(path), "%s/sys/class/net/%s/brif", c->root,
+		 c->br[b].name);
+	dir = opendir(path);
+	if (!dir) {
+		snprintf(err, errlen, "%s is not a bridge", c->br[b].name);
+		return -1;
+	}
+	while ((d = readdir(dir))) {
+		struct port *p;
+		int auto_c = !strcmp(c->clients_spec, "auto");
+		int auto_u = !strcmp(c->uplinks_spec, "auto");
+
+		if (d->d_name[0] == '.')
+			continue;
+		if (c->nport == MAX_PORTS) {
+			closedir(dir);
+			snprintf(err, errlen, "too many bridge ports");
+			return -1;
+		}
+		p = &c->port[c->nport];
+		memset(p, 0, sizeof(*p));
+		copy(p->name, sizeof(p->name), d->d_name);
+		resolve_lower(c, p->name, p->lower);
+		p->bridge = b;
+		if (!auto_c && in_list(c->clients_spec, p->name))
+			p->role = ROLE_CLIENT;
+		else if (!auto_u && in_list(c->uplinks_spec, p->name))
+			p->role = ROLE_UPLINK;
+		else if (auto_c && has_prefix(c->client_prefix, p->lower))
+			p->role = ROLE_CLIENT;
+		else if (auto_u && has_prefix(c->uplink_prefix, p->lower))
+			p->role = ROLE_UPLINK;
+		if (p->role == ROLE_NONE)
+			continue;	/* e.g. gre tunnels: left alone */
+		if (p->role == ROLE_CLIENT)
+			clients++;
+		else
+			uplinks++;
+		c->nport++;
+	}
+	closedir(dir);
+	if (!clients || !uplinks) {
+		/* nothing to relay between: ignore this bridge */
+		c->nport = first;
+		return 1;
+	}
 	return 0;
 }
 
 int config_resolve(struct config *c, char *err, size_t errlen)
 {
-	if (resolve_id(c, c->circuit_id, c->o82.cid, &c->o82.cid_len,
-		       err, errlen) < 0)
-		return -1;
-	if (!c->o82.cid_len) {
-		snprintf(err, errlen, "circuit_id must not be empty");
-		return -1;
-	}
-	if (!strcmp(c->remote_id, "none") || !c->remote_id[0])
-		c->o82.rid_len = 0;
-	else if (resolve_id(c, c->remote_id, c->o82.rid, &c->o82.rid_len,
-			    err, errlen) < 0)
-		return -1;
-	if (c->o82.cid_len + c->o82.rid_len + 4 > 255) {
-		snprintf(err, errlen, "circuit_id + remote_id too long");
+	struct bridge br[MAX_BRIDGES];
+	int i, nbr, r;
+
+	c->nbr = 0;
+	c->nport = 0;
+	if (system_hostname(c->system_cfg, c->hostname,
+			    sizeof(c->hostname)) < 0) {
+		snprintf(err, errlen, "cannot determine hostname");
 		return -1;
 	}
-	if (!strcmp(c->client_if, c->uplink_if)) {
-		snprintf(err, errlen, "client and uplink must differ");
+	r = !strcmp(c->bridges_spec, "auto") ? detect_bridges(c, err, errlen)
+					     : bridges_from_list(c, err, errlen);
+	if (r < 0)
+		return -1;
+
+	/* keep only bridges that have client and uplink ports */
+	memcpy(br, c->br, sizeof(br));
+	nbr = c->nbr;
+	c->nbr = 0;
+	for (i = 0; i < nbr; i++) {
+		int b = c->nbr, k;
+
+		c->br[b] = br[i];
+		c->nbr++;
+		r = scan_bridge(c, b, err, errlen);
+		if (r < 0)
+			return -1;
+		if (r > 0) {
+			c->nbr--;
+			continue;
+		}
+		for (k = 0; k < c->nport; k++) {
+			struct port *p = &c->port[k];
+
+			if (p->bridge != b || p->role != ROLE_CLIENT)
+				continue;
+			p->o82.mtu = c->mtu;
+			p->o82.type_mask = c->type_mask;
+			if (expand(c, c->circuit_id, p, p->o82.cid,
+				   &p->o82.cid_len) < 0 || !p->o82.cid_len) {
+				snprintf(err, errlen, "bad circuit_id for %s",
+					 p->name);
+				return -1;
+			}
+			if (!strcmp(c->remote_id, "none") || !c->remote_id[0])
+				p->o82.rid_len = 0;
+			else if (expand(c, c->remote_id, p, p->o82.rid,
+					&p->o82.rid_len) < 0) {
+				snprintf(err, errlen, "bad remote_id for %s",
+					 p->name);
+				return -1;
+			}
+			if (p->o82.cid_len + p->o82.rid_len + 4 > 255) {
+				snprintf(err, errlen,
+					 "circuit_id + remote_id too long");
+				return -1;
+			}
+		}
+	}
+	if (!c->nbr) {
+		snprintf(err, errlen, "no bridge with both a client (%s) and an "
+			 "uplink (%s) port", c->client_prefix, c->uplink_prefix);
 		return -1;
 	}
 	return 0;

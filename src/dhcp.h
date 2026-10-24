@@ -103,6 +103,9 @@ enum verdict dhcp_handle_reply(uint8_t *frame, size_t *len,
  * marked whose option 82 an upstream relay replaced. Returns 0 if stripped. */
 int dhcp_strip_o82(uint8_t *frame, size_t len);
 
+/* 1 if the option 82 decoded into info is the one cfg inserts */
+int dhcp_o82_matches(const struct dhcp_info *info, const struct o82_cfg *cfg);
+
 const char *dhcp_reason_str(enum reason r);
 const char *dhcp_type_str(uint8_t t);
 
