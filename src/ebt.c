@@ -147,6 +147,25 @@ int ebt_install(const struct config *c)
 	    (char *)"--ip-dport", (char *)"68", (char *)"-j", (char *)"DROP");
 	if (rc != 0)
 		goto fail;
+	/* DHCP snooping: diverted frames nobody listens for are discarded
+	 * by the IP stack of the port (no address there) */
+	if (c->block_client_servers) {
+		EBT((char *)"-A", (char *)EBT_CHAIN, (char *)"-p", (char *)"IPv4",
+		    (char *)"-i", (char *)c->client_if,
+		    (char *)"--ip-proto", (char *)"udp",
+		    (char *)"--ip-sport", (char *)"67",
+		    (char *)"--ip-dport", (char *)"68", (char *)"-j", (char *)"DROP");
+		if (rc != 0)
+			goto fail;
+	}
+	if (c->block_uplink_requests) {
+		EBT((char *)"-A", (char *)EBT_CHAIN, (char *)"-p", (char *)"IPv4",
+		    (char *)"-i", (char *)c->uplink_if,
+		    (char *)"--ip-proto", (char *)"udp",
+		    (char *)"--ip-dport", (char *)"67", (char *)"-j", (char *)"DROP");
+		if (rc != 0)
+			goto fail;
+	}
 	rc = jump_count(c);
 	while (rc > 1) {	/* duplicate jumps, e.g. after a race */
 		EBT((char *)"-D", (char *)"BROUTING", (char *)"-j",
@@ -201,8 +220,8 @@ int ebt_check(const struct config *c)
 {
 	char *const lc[] = { (char *)"ebtables", (char *)"-t", (char *)"broute",
 			     (char *)"-L", (char *)EBT_CHAIN, NULL };
-	char *buf = list_buf;
-	int rc;
+	char *buf = list_buf, want[48];
+	int rc, n = 2 + !!c->block_client_servers + !!c->block_uplink_requests;
 
 	rc = jump_count(c);
 	if (rc < 0)
@@ -212,9 +231,10 @@ int ebt_check(const struct config *c)
 	rc = run(c, lc, buf, sizeof(list_buf));
 	if (rc != 0)
 		return 0;
-	if (!strstr(buf, "entries: 2, policy: RETURN"))
+	snprintf(want, sizeof(want), "entries: %d, policy: RETURN", n);
+	if (!strstr(buf, want))
 		return 0;
-	if (count(buf, "-j DROP") != 2)
+	if (count(buf, "-j DROP") != n)
 		return 0;
 	return 1;
 }

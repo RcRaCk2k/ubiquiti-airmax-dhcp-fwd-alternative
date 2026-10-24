@@ -72,7 +72,7 @@ dhcp-fwd --diag 60                       # zeigt pro Socket: ALL = alles, IP = n
 # Regeln
 ebtables -t broute -L --Lc               # Sprung nach DHCP_SNOOPING_82 an Position 1
 ebtables -t broute -L DHCP_SNOOPING_82 --Lc    # Zähler = ausgeleitete DHCP-Frames
-ebtables -L --Lc                         # airOS-Filter (FORWARD/FIREWALL)
+ebtables -L --Lc                         # airOS-Filter; FIREWALL-DHCP-Regeln werden nicht mehr gebraucht
 
 # Prozesse
 pidof dhcp-fwd; grep " /bin/dhcp-fwd " /proc/mounts
@@ -98,7 +98,9 @@ req-mark if=eth0/2 type=REQUEST xid=0x30336d42 chaddr=1c:ed:6f:00:00:01 src=1c:e
 | Antwort mit fremder Option 82, durchgereichter Request | unverändert an eth0 |
 | sonstige Antwort mit fremder Option 82 | verwerfen (andere Station) |
 | Antwort ohne Option 82 | weiterleiten |
-| DHCP vom Uplink an Port 67 | nicht angefasst (das regelt die airOS-FIREWALL) |
+| DHCP-Request vom Uplink (Kunden anderer Stationen) | verworfen (Snooping, `block_uplink_requests`) |
+| DHCP-Server-Antwort von eth0 (Server beim Kunden) | verworfen (Snooping, `block_client_servers`) |
+| BOOTREPLY an Port 67 von eth0 / BOOTREQUEST an Port 68 vom Uplink | verworfen |
 | Worker abgestürzt | Regeln bleiben (fail-closed), Neustart mit Backoff |
 | airOS löscht Regeln (Apply) | innerhalb von 5 s neu gesetzt; dazwischen gilt das airOS-Verhalten, ohne Duplikate |
 | SIGTERM (Relay im Webinterface aus, deactivate) | Regeln entfernen, beenden |

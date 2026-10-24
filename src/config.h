@@ -32,6 +32,8 @@ struct config {
 	int		reply_foreign;		/* POL_DROP default */
 	int		reply_no_o82;		/* POL_FORWARD default */
 	int		keep_rules_on_stop;
+	int		block_client_servers;	/* snooping: DHCP server on eth0 */
+	int		block_uplink_requests;	/* snooping: other customers */
 	unsigned	rate_pps;		/* per direction, 0 = off */
 	unsigned	rate_burst;
 

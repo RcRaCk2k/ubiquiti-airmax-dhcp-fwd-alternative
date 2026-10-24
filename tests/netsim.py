@@ -202,6 +202,10 @@ def send(iface, kind):
         f = frame(BCAST, SERVER_MAC, SERVER_IP, 0xFFFFFFFF, 67, 68,
                   bootp(2, 0xABCDEF01, CLIENT_MAC, 2, yiaddr=LEASE_IP,
                         options=bytes([82, len(raw)]) + raw))
+    elif kind == "rogue-offer":
+        # a DHCP server behind the customer's port
+        f = frame(BCAST, CLIENT_MAC, 0xC0A8B201, 0xFFFFFFFF, 67, 68,
+                  bootp(2, 0x0BADF00D, other, 2, yiaddr=0xC0A8B264))
     else:
         raise SystemExit("unknown kind")
     s.send(f)

@@ -414,6 +414,10 @@ static int handle_client(int fd_in, int fd_out, int ifindex, time_t now,
 				v = VERDICT_DROP;
 				st.req_dropped_policy++;
 			}
+		} else if (info.reason == R_WRONG_OP) {
+			/* BOOTREPLY from the customer: rogue server or relay */
+			v = VERDICT_DROP;
+			st.req_dropped_policy++;
 		} else if (info.reason == R_INSERTED) {
 			xid_add(info.xid, info.chaddr, 1, now);
 			/* log what we put in, not what came in */
@@ -494,6 +498,7 @@ static int handle_uplink(int fd_in, int fd_out, int ifindex, time_t now,
 			}
 			break;
 		case R_WRONG_OP:
+			v = VERDICT_DROP;
 			st.rep_wrong_op++;
 			break;
 		default:
@@ -901,6 +906,10 @@ static int status(void)
 	}
 	r = ebt_check(&cfg);
 	printf("broute_rules %s\n", r == 1 ? "ok" : r == 0 ? "missing" : "error");
+	printf("snooping client_servers=%s uplink_requests=%s "
+	       "(counters: ebtables -t broute -L %s --Lc)\n",
+	       cfg.block_client_servers ? "blocked" : "allowed",
+	       cfg.block_uplink_requests ? "blocked" : "allowed", EBT_CHAIN);
 	return r == 1 ? 0 : 1;
 }
 

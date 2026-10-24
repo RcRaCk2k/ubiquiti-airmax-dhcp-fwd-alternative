@@ -60,6 +60,8 @@ void config_defaults(struct config *c)
 	c->existing_o82 = POL_FORWARD;
 	c->reply_foreign = POL_DROP;
 	c->reply_no_o82 = POL_FORWARD;
+	c->block_client_servers = 1;
+	c->block_uplink_requests = 1;
 	c->rate_pps = 20;
 	c->rate_burst = 50;
 	c->auto_rollback = 0;
@@ -198,6 +200,10 @@ static int set_key(struct config *c, const char *sec, const char *key,
 		return parse_policy(val, &c->reply_foreign);
 	if (KEY("reply", "without_option82"))
 		return parse_policy(val, &c->reply_no_o82);
+	if (KEY("snooping", "block_client_servers"))
+		return parse_bool(val, &c->block_client_servers);
+	if (KEY("snooping", "block_uplink_requests"))
+		return parse_bool(val, &c->block_uplink_requests);
 	if (KEY("forwarding", "rate_limit"))
 		return parse_uint(val, &c->rate_pps, 10000);
 	if (KEY("forwarding", "rate_burst"))

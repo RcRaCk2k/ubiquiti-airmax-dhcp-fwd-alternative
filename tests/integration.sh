@@ -63,6 +63,8 @@ table bridge ds82 {
 		type filter hook prerouting priority -300;
 		iifname "eth0" ip protocol udp udp dport 67 meta broute set 1
 		iifname "ath0.1284" ether daddr != $BRMAC ip protocol udp udp sport 67 udp dport 68 meta broute set 1
+		iifname "eth0" ip protocol udp udp sport 67 udp dport 68 meta broute set 1
+		iifname "ath0.1284" ip protocol udp udp dport 67 meta broute set 1
 	}
 }
 EOF
@@ -74,7 +76,7 @@ cat > "$W/ebtables" <<'EOF'
 #!/bin/sh
 case "$*" in
 *"-L BROUTING"*) echo "Bridge chain: BROUTING, entries: 1, policy: ACCEPT"; echo "-j DHCP_SNOOPING_82 " ;;
-*"-L DHCP_SNOOPING_82"*) echo "Bridge chain: DHCP_SNOOPING_82, entries: 2, policy: RETURN"; echo "-j DROP "; echo "-j DROP " ;;
+*"-L DHCP_SNOOPING_82"*) echo "Bridge chain: DHCP_SNOOPING_82, entries: 4, policy: RETURN"; for i in 1 2 3 4; do echo "-j DROP "; done ;;
 esac
 exit 0
 EOF
@@ -149,7 +151,7 @@ sys.exit(0 if ok else 1)
 EOF
 
 # --- 2: uplink broadcast must not be marked again --------------------
-echo "2) foreign DISCOVER from uplink is not re-marked"
+echo "2) foreign DISCOVER from uplink: not re-marked, not passed to customer"
 ins $SIM sniff s0 "$W/server2.log" 3 &
 SN1=$!
 inc $SIM sniff c0 "$W/client2.log" 3 &
@@ -159,8 +161,15 @@ ins $SIM send s0 foreign-discover
 wait $SN1 $SN2
 expect "$(count f0f0f0f0 "$W/server2.log")" 0 "no copy sent back to the uplink"
 expect "$(grep -c '"xid": 4042322160' "$W/server2.log" || true)" 0 "no duplicate on uplink"
-expect "$(grep -c '"xid": 4042322160' "$W/client2.log" || true)" 1 "bridged once to client side, unmodified"
-expect "$(grep '"xid": 4042322160' "$W/client2.log" | grep -c 'cust-example' || true)" 0 "no option 82 of ours added"
+expect "$(grep -c '"xid": 4042322160' "$W/client2.log" || true)" 0 "snooping: other customer's request blocked"
+
+echo "2b) DHCP server on the customer side is blocked"
+ins $SIM sniff s0 "$W/server2b.log" 3 &
+SN=$!
+sleep 0.5
+inc $SIM send c0 rogue-offer
+wait $SN
+expect "$(grep -c '"op": 2' "$W/server2b.log" || true)" 0 "rogue OFFER does not reach the uplink"
 
 # --- 3: foreign reply is filtered -----------------------------------
 echo "3) OFFER with foreign option 82 does not reach the client"

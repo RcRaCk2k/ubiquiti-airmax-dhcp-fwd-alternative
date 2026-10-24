@@ -74,6 +74,12 @@ passiver Mitschnitt auf `eth0`, `ath0.1284` und `br1`.
   weiterleiten (falls der MikroTik unsere ersetzt). Bei durchgereichten
   Requests unverändert weiterleiten, sonst verwerfen. Ohne Option 82
   weiterleiten.
+* DHCP-Snooping im Agent (ersetzt die airOS-FIREWALL-Regeln „Rogue
+  DHCP-Server“ und „Disallow DHCP Requests“): broute-DROP für
+  `-i eth0 sport 67 dport 68` und `-i ath0.1284 dport 67`. Diese Frames
+  landen im IP-Stack des Ports, der keine Adresse hat, und werden dort
+  verworfen. Ist der Agent aus (Relay im Webinterface deaktiviert), ist auch
+  das Snooping aus.
 * `giaddr` setzt der Agent nie, das macht der MikroTik-Relay mit seiner
   öffentlichen IP.
 * Watcher setzt Regeln wieder ein, die airOS gelöscht hat (alle 5 s), und
