@@ -51,6 +51,30 @@ passiver Mitschnitt auf `eth0`, `ath0.1284` und `br1`.
    `giaddr=0` und gibt die Option 82 zurück; der MikroTik entfernt sie auf dem
    Rückweg nicht.
 
+## Erster aktiver Test am Kundengerät (2026-10-24, 20:32 und 20:35)
+
+Agent im RAM gestartet (`/tmp`, kein Flash, Relay im Webinterface aus),
+zweimal „Neu verbinden“ an der FRITZ!Box:
+
+* RELEASE, DISCOVER und REQUEST bekamen Option 82
+  (`cust-example` / `00005e005301`). OFFER und ACK kamen über den
+  MikroTik-Relay (`giaddr` = öffentliche Relay-IP, `hops=1`) ohne
+  Option 82 zurück und wurden an eth0 zugestellt. Request bis ACK etwa 80 ms.
+* Beim Server kam jeder Request **genau einmal** an. Der MikroTik **behält
+  unsere Suboptionen 1/2** und hängt nur Sub 5 (Link Selection) und Sub 11
+  (Server ID Override) an. Die Option 82 seines Bridge-Snoopings fehlt dann.
+* `--diag` parallel: Ausgeleitete Frames erscheinen am `IP@eth0`- bzw.
+  `IP@ath0.1284`-Socket. Damit ist der Paketpfad auf 2.6.32 in beiden
+  Richtungen belegt.
+* **Funk-Echo:** Etwa 7 ms nach dem Senden (`OUTGOING`) kommt jeder
+  Broadcast als `BROADCAST` auf ath0.1284 zurück, offenbar vom AP. Das Echo
+  sehen nur `ETH_P_ALL`-Taps. Es erreicht weder die broute-Kette (Zähler der
+  Uplink-Snooping-Regel 0) noch den Agent, und der FDB-Eintrag des Kunden
+  bleibt auf eth0. Vermutlich hat genau so ein Echo das alte `dhcp-fwd`
+  (UDP-Socket an br1) erneut verarbeitet.
+* ebtables-Syntax inkl. `-d !` und Policy `RETURN` funktioniert mit
+  v2.0.10-4; Worker läuft als uid 99, 240 KB VSZ.
+
 ## Architektur dhcp-snooping-82 (Kurzfassung)
 
 * Eigener Agent (MIT), kein Code aus dhcp-fwd.
@@ -88,10 +112,10 @@ passiver Mitschnitt auf `eth0`, `ath0.1284` und `br1`.
 
 ## Offene Punkte
 
-* Verhalten des Upstream-MikroTik (Port `sfp-sfpplus23`) bei Requests, die
-  schon Option 82 enthalten: trusted/untrusted, ersetzen oder behalten?
 * Eigener DHCP-Server: Antwortet er bei `giaddr=0` und gibt er Option 82
   zurück? Welche Kennung wertet er aus?
 * Persistenz ohne Boot-Hook (siehe README, „Persistenz“).
-* Altes Kernelverhalten (broute + `ETH_P_IP`-Zustellung) auf dem Testgerät mit
-  `--diag` nachweisen.
+* Unicast-Renew über den Agent (wegen Sub 11 jetzt an die Relay-IP).
+* Bind-Mount über `/bin/dhcp-fwd` und Start durch init auf dem Gerät testen.
+* Syslog-Zeitstempel des statischen Binaries sind UTC (musl kennt die
+  airOS-Zeitzone nicht).
