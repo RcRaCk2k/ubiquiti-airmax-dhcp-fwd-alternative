@@ -24,11 +24,11 @@ License: MIT ([LICENSE](LICENSE)).
 ## Build
 
 ```sh
-make toolchain      # Zig 0.13.0 (clang + musl), SHA256 verified, into .toolchain/
-make                # build/mips/dhcp-fwd: static, MIPS32r2 BE, soft-float
-make test           # unit tests (ASan/UBSan, fuzzing), tshark check, port detection
-make integration    # bridge simulation in network namespaces, no root needed
-make dist           # build/dist/dhcp-snooping-82-<ver>.tar.gz
+make toolchain    # Zig 0.13.0 (clang + musl), SHA256 verified, into .toolchain/
+make              # build/mips/dhcp-fwd: static, MIPS32r2 BE, soft-float
+make test         # unit tests (ASan/UBSan, fuzzing), tshark check, port detection
+make integration  # bridge simulation in network namespaces, no root needed
+make dist         # build/dist/dhcp-snooping-82-<ver>.tar.gz
 ```
 
 The build is reproducible: the same sources give a bit-identical binary, its
@@ -85,10 +85,10 @@ Rules for explicit ports:
 # on the PC
 scp build/mips/dhcp-fwd scripts/dhcp-snooping-82.sh etc/dhcp-snooping-82.conf root@DEVICE:/tmp/
 # on the device
-sh /tmp/dhcp-snooping-82.sh install            # to /etc/persistent/dhcp-snooping-82, checks the binary
-/etc/persistent/dhcp-snooping-82/dhcp-fwd --check     # detected bridges, ports, IDs
-/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh diag 120   # passive, sends nothing
-/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh activate   # health check, rollback on failure
+sh /tmp/dhcp-snooping-82.sh install                            # to /etc/persistent/dhcp-snooping-82, checks the binary
+/etc/persistent/dhcp-snooping-82/dhcp-fwd --check              # detected bridges, ports, IDs
+/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh diag 120  # passive, sends nothing
+/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh activate  # health check, rollback on failure
 /etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh status
 # only when everything works, save to flash:
 sh /etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh install --save
@@ -125,20 +125,20 @@ ssh root@DEVICE '/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh ensure'
 ## Operation and diagnosis
 
 ```sh
-dhcp-snooping-82.sh status                     # mode, processes, counters, rules
-cat /var/run/dhcp-snooping-82.stats            # counters (updated every 10 s)
-grep dhcp-fwd /var/log/messages          # log (RAM), one line per packet
-kill -HUP $(cat /var/run/dhcp-fwd.pid)   # reload the configuration
+dhcp-snooping-82.sh status                   # mode, processes, counters, rules
+cat /var/run/dhcp-snooping-82.stats          # counters (updated every 10 s)
+grep dhcp-fwd /var/log/messages              # log (RAM), one line per packet
+kill -HUP $(cat /var/run/dhcp-fwd.pid)       # reload the configuration
 
 # packet path
 tcpdump -i eth0      -e -n -vvv -s0 'udp port 67 or udp port 68'
 tcpdump -i ath0.1284 -e -n -vvv -s0 'udp port 67 or udp port 68'
-dhcp-fwd --diag 60                       # per socket: ALL = everything, IP = diverted only
+dhcp-fwd --diag 60                           # per socket: ALL = everything, IP = diverted only
 
 # rules
-ebtables -t broute -L --Lc               # jump to DHCP_SNOOPING_82 at position 1
-ebtables -t broute -L DHCP_SNOOPING_82 --Lc    # counters = diverted DHCP frames
-ebtables -L --Lc                         # airOS filter; FIREWALL DHCP rules no longer needed
+ebtables -t broute -L --Lc                   # jump to DHCP_SNOOPING_82 at position 1
+ebtables -t broute -L DHCP_SNOOPING_82 --Lc  # counters = diverted DHCP frames
+ebtables -L --Lc                             # airOS filter; FIREWALL DHCP rules no longer needed
 
 # processes
 pidof dhcp-fwd; grep " /bin/dhcp-fwd" /proc/mounts
