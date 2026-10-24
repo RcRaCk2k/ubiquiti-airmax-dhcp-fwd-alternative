@@ -60,6 +60,13 @@ static struct config cfg;
 static const char *own_cfg_path = DEFAULT_CONFIG;
 static char abs_cfg_path[PATH_MAX];
 
+/* options from the command line, applied on top of the config file (also
+ * on every SIGHUP reload) */
+#define MAX_CLI_OPTS	64
+static struct { const char *name, *val; } cli_opt[MAX_CLI_OPTS];
+static int n_cli_opt;
+static char cli_names[MAX_CLI_OPTS][96];
+
 /* ------------------------------------------------------------------ */
 
 static time_t mono(void)
@@ -751,14 +758,28 @@ static void run_rollback(void)
 		pause();
 }
 
+/* defaults, then the config file (if there is one), then the command line */
+static int load_config(struct config *c, char *err, size_t errlen)
+{
+	int i;
+
+	config_defaults(c);
+	if (access(own_cfg_path, R_OK) == 0 &&
+	    config_load(c, own_cfg_path, err, errlen) < 0)
+		return -1;
+	for (i = 0; i < n_cli_opt; i++)
+		if (config_set(c, cli_opt[i].name, cli_opt[i].val, err,
+			       errlen) < 0)
+			return -1;
+	return 0;
+}
+
 static int reload_config(void)
 {
 	struct config n;
 	char err[256];
 
-	config_defaults(&n);
-	if (config_is_ours(own_cfg_path) &&
-	    config_load(&n, own_cfg_path, err, sizeof(err)) < 0) {
+	if (load_config(&n, err, sizeof(err)) < 0) {
 		LOGE("reload: %s (keeping old config)", err);
 		return -1;
 	}
@@ -970,8 +991,9 @@ static int diag(unsigned seconds)
 static void usage(void)
 {
 	printf("dhcp-snooping-82 %s - transparent DHCP option 82 agent\n"
-	       "usage: dhcp-fwd [-n] [-d] [-c airos.conf] [-C own.conf]\n"
-	       "       dhcp-fwd --check | --status | --diag [seconds] | -v\n"
+	       "usage: dhcp-fwd [-n] [-d] [-c airos.conf] [-C own.conf] [options]\n"
+	       "       dhcp-fwd [options] --check | --status | --diag [seconds]\n"
+	       "       dhcp-fwd -v\n"
 	       "  -n          stay in foreground (as started by airOS init)\n"
 	       "  -d          foreground, log to stderr, level debug\n"
 	       "  -c FILE     airOS dhcp-fwd.conf; ignored unless it uses our\n"
@@ -979,7 +1001,21 @@ static void usage(void)
 	       "  -C FILE     own configuration (default %s)\n"
 	       "  --check     print resolved configuration and exit\n"
 	       "  --status    print counters and rule state\n"
-	       "  --diag [s]  passive packet path diagnosis\n",
+	       "  --diag [s]  passive packet path diagnosis\n"
+	       "options (override the configuration file):\n"
+	       "  -u, --untrusted BRIDGE:PORT[,...]\n"
+	       "              customer port: option 82 is added to requests,\n"
+	       "              DHCP servers are blocked\n"
+	       "  -t, --trusted BRIDGE:PORT[,...]\n"
+	       "              uplink port towards the DHCP server\n"
+	       "              Without -u/-t, bridges come from the airOS relay\n"
+	       "              settings and ports are classified by name.\n"
+	       "  -i, --circuit-id TEMPLATE   default %%h/%%b:%%p\n"
+	       "  -r, --remote-id TEMPLATE    default %%m, \"none\" to omit\n"
+	       "              %%h hostname, %%b bridge, %%p port, %%m bridge MAC,\n"
+	       "              %%M port MAC, %%%% percent sign\n"
+	       "  -o, --option SECTION.KEY=VALUE\n"
+	       "              any key of the configuration file\n",
 	       VERSION, DEFAULT_CONFIG);
 }
 
@@ -990,6 +1026,8 @@ static void print_config(void)
 
 	printf("version         %s\n", VERSION);
 	printf("hostname        %s\n", cfg.hostname);
+	printf("ports           %s\n", cfg.nxport ?
+	       "explicit (untrusted/trusted)" : "auto (airOS relay, port names)");
 	printf("circuit_id      %s\n", cfg.circuit_id);
 	printf("remote_id       %s\n", cfg.remote_id);
 	for (i = 0; i < cfg.nbr; i++)
@@ -1056,9 +1094,54 @@ static void write_pidfile(void)
 	close(fd);
 }
 
+/* short and long options that are shortcuts for a config key */
+static const char *cli_alias(const char *a)
+{
+	static const struct { const char *s, *l, *key; } map[] = {
+		{ "-u", "--untrusted", "interface.untrusted" },
+		{ "-t", "--trusted", "interface.trusted" },
+		{ "-i", "--circuit-id", "option82.circuit_id" },
+		{ "-r", "--remote-id", "option82.remote_id" },
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+		if (!strcmp(a, map[i].s) || !strcmp(a, map[i].l))
+			return map[i].key;
+	return NULL;
+}
+
+/* name NULL: arg is "section.key=value" */
+static int add_cli_opt(const char *name, const char *arg)
+{
+	const char *val = arg;
+
+	if (n_cli_opt == MAX_CLI_OPTS) {
+		fprintf(stderr, "too many options\n");
+		return -1;
+	}
+	if (!name) {
+		const char *eq = strchr(arg, '=');
+		size_t l = eq ? (size_t)(eq - arg) : 0;
+
+		if (!l || l >= sizeof(cli_names[0])) {
+			fprintf(stderr, "-o %s: expected SECTION.KEY=VALUE\n", arg);
+			return -1;
+		}
+		memcpy(cli_names[n_cli_opt], arg, l);
+		cli_names[n_cli_opt][l] = '\0';
+		name = cli_names[n_cli_opt];
+		val = eq + 1;
+	}
+	cli_opt[n_cli_opt].name = name;
+	cli_opt[n_cli_opt].val = val;
+	n_cli_opt++;
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
-	const char *airos_cfg = NULL;
+	const char *airos_cfg = NULL, *opt;
 	char err[256];
 	int foreground = 0, debug = 0, mode = 0, i, rc;
 	unsigned diag_secs = 0;
@@ -1082,6 +1165,13 @@ int main(int argc, char **argv)
 			mode = 'd';
 			if (i + 1 < argc && argv[i + 1][0] != '-')
 				diag_secs = (unsigned)strtoul(argv[++i], NULL, 10);
+		} else if ((opt = cli_alias(a)) && i + 1 < argc) {
+			if (add_cli_opt(opt, argv[++i]) < 0)
+				return 2;
+		} else if ((!strcmp(a, "-o") || !strcmp(a, "--option")) &&
+			   i + 1 < argc) {
+			if (add_cli_opt(NULL, argv[++i]) < 0)
+				return 2;
 		} else if (!strcmp(a, "-v") || !strcmp(a, "--version")) {
 			printf("dhcp-snooping-82 %s\n", VERSION);
 			return 0;
@@ -1102,9 +1192,7 @@ int main(int argc, char **argv)
 	if (realpath(own_cfg_path, abs_cfg_path))
 		own_cfg_path = abs_cfg_path;
 
-	config_defaults(&cfg);
-	if (access(own_cfg_path, R_OK) == 0 &&
-	    config_load(&cfg, own_cfg_path, err, sizeof(err)) < 0) {
+	if (load_config(&cfg, err, sizeof(err)) < 0) {
 		fprintf(stderr, "%s\n", err);
 		return 2;
 	}
@@ -1157,8 +1245,10 @@ int main(int argc, char **argv)
 		}
 	}
 	write_pidfile();
-	LOGI("dhcp-snooping-82 %s starting (config %s)", VERSION,
-	     access(own_cfg_path, R_OK) == 0 ? own_cfg_path : "defaults");
+	LOGI("dhcp-snooping-82 %s starting (config %s%s, ports %s)", VERSION,
+	     access(own_cfg_path, R_OK) == 0 ? own_cfg_path : "defaults",
+	     n_cli_opt ? " + command line" : "",
+	     cfg.nxport ? "explicit" : "auto");
 	rc = watcher();
 	unlink(cfg.pidfile);
 	return rc;

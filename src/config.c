@@ -167,6 +167,58 @@ static int parse_level(const char *v, int *out)
 	return -1;
 }
 
+static void copy_n(char *dst, size_t n, const char *src, size_t l)
+{
+	if (l >= n)
+		l = n - 1;
+	memcpy(dst, src, l);
+	dst[l] = '\0';
+}
+
+/* "br1:eth0, br1:eth1" -> explicit ports with the given role */
+static int add_xports(struct config *c, const char *list, int role)
+{
+	const char *p = list;
+
+	while (*p) {
+		const char *colon;
+		struct xport x;
+		size_t n;
+		int i;
+
+		p += strspn(p, ", ");
+		n = strcspn(p, ", ");
+		if (!n)
+			break;
+		colon = memchr(p, ':', n);
+		if (!colon || colon == p || colon == p + n - 1 ||
+		    (size_t)(colon - p) >= IFNAMSIZ ||
+		    (size_t)(p + n - colon - 1) >= IFNAMSIZ ||
+		    memchr(colon + 1, ':', (size_t)(p + n - colon - 1)))
+			return -1;
+		memset(&x, 0, sizeof(x));
+		copy_n(x.bridge, sizeof(x.bridge), p, (size_t)(colon - p));
+		copy_n(x.name, sizeof(x.name), colon + 1,
+		       (size_t)(p + n - colon - 1));
+		x.role = role;
+		for (i = 0; i < c->nxport; i++)
+			if (!strcmp(c->xport[i].name, x.name))
+				break;
+		if (i < c->nxport) {
+			/* the same port twice is fine, with two roles not */
+			if (c->xport[i].role != role ||
+			    strcmp(c->xport[i].bridge, x.bridge))
+				return -1;
+		} else {
+			if (c->nxport == MAX_PORTS)
+				return -1;
+			c->xport[c->nxport++] = x;
+		}
+		p += n;
+	}
+	return 0;
+}
+
 #define KEY(s, k)	(!strcmp(sec, s) && !strcmp(key, k))
 #define STR(dst)	(copy(dst, sizeof(dst), val), 0)
 
@@ -182,6 +234,10 @@ static int set_key(struct config *c, const char *sec, const char *key,
 		return STR(c->clients_spec);
 	if (KEY("interface", "uplinks"))
 		return STR(c->uplinks_spec);
+	if (KEY("interface", "untrusted"))
+		return add_xports(c, val, ROLE_CLIENT);
+	if (KEY("interface", "trusted"))
+		return add_xports(c, val, ROLE_UPLINK);
 	if (KEY("interface", "client_prefix"))
 		return STR(c->client_prefix);
 	if (KEY("interface", "uplink_prefix"))
@@ -314,6 +370,28 @@ int config_load(struct config *c, const char *path, char *err, size_t errlen)
 		}
 	}
 	return 0;
+}
+
+int config_set(struct config *c, const char *name, const char *val,
+	       char *err, size_t errlen)
+{
+	const char *dot = strchr(name, '.');
+	char sec[32], key[64];
+	int r;
+
+	if (!dot || dot == name || (size_t)(dot - name) >= sizeof(sec) ||
+	    strlen(dot + 1) >= sizeof(key)) {
+		snprintf(err, errlen, "bad option name %s (section.key)", name);
+		return -1;
+	}
+	copy_n(sec, sizeof(sec), name, (size_t)(dot - name));
+	copy(key, sizeof(key), dot + 1);
+	r = set_key(c, sec, key, val);
+	if (r == -2)
+		snprintf(err, errlen, "unknown option %s", name);
+	else if (r < 0)
+		snprintf(err, errlen, "invalid value for %s: %s", name, val);
+	return r < 0 ? -1 : 0;
 }
 
 int config_is_ours(const char *path)
@@ -720,18 +798,85 @@ static int scan_bridge(struct config *c, int b, char *err, size_t errlen)
 	return 0;
 }
 
-int config_resolve(struct config *c, char *err, size_t errlen)
+static int bridge_index(struct config *c, const char *name, char *err,
+			size_t errlen)
+{
+	char path[256];
+	int i;
+
+	for (i = 0; i < c->nbr; i++)
+		if (!strcmp(c->br[i].name, name))
+			return i;
+	if (add_bridge(c, name) < 0) {
+		snprintf(err, errlen, "too many bridges");
+		return -1;
+	}
+	if (read_mac(c, name, c->br[i].mac) < 0) {
+		snprintf(err, errlen, "bridge %s not found", name);
+		return -1;
+	}
+	snprintf(path, sizeof(path), "%s/sys/class/net/%s/brif", c->root, name);
+	if (access(path, F_OK) < 0) {
+		snprintf(err, errlen, "%s is not a bridge", name);
+		return -1;
+	}
+	return i;
+}
+
+/* ports given on the command line or as [interface] untrusted/trusted:
+ * exactly those, no system.cfg and no name based classification */
+static int explicit_ports(struct config *c, char *err, size_t errlen)
+{
+	char path[256];
+	int i, b;
+
+	for (i = 0; i < c->nxport; i++) {
+		const struct xport *x = &c->xport[i];
+		struct port *p = &c->port[c->nport];
+
+		b = bridge_index(c, x->bridge, err, errlen);
+		if (b < 0)
+			return -1;
+		snprintf(path, sizeof(path), "%s/sys/class/net/%s/brif/%s",
+			 c->root, x->bridge, x->name);
+		if (access(path, F_OK) < 0) {
+			snprintf(err, errlen, "%s is not a port of %s", x->name,
+				 x->bridge);
+			return -1;
+		}
+		memset(p, 0, sizeof(*p));
+		copy(p->name, sizeof(p->name), x->name);
+		resolve_lower(c, p->name, p->lower);
+		p->bridge = b;
+		p->role = x->role;
+		c->nport++;
+	}
+	for (b = 0; b < c->nbr; b++) {
+		int clients = 0, uplinks = 0;
+
+		for (i = 0; i < c->nport; i++) {
+			if (c->port[i].bridge != b)
+				continue;
+			if (c->port[i].role == ROLE_CLIENT)
+				clients++;
+			else
+				uplinks++;
+		}
+		if (!clients || !uplinks) {
+			snprintf(err, errlen, "bridge %s needs at least one "
+				 "trusted and one untrusted port", c->br[b].name);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* bridges from system.cfg (or the bridges list), ports by name */
+static int auto_ports(struct config *c, char *err, size_t errlen)
 {
 	struct bridge br[MAX_BRIDGES];
 	int i, nbr, r;
 
-	c->nbr = 0;
-	c->nport = 0;
-	if (system_hostname(c->system_cfg, c->hostname,
-			    sizeof(c->hostname)) < 0) {
-		snprintf(err, errlen, "cannot determine hostname");
-		return -1;
-	}
 	r = !strcmp(c->bridges_spec, "auto") ? detect_bridges(c, err, errlen)
 					     : bridges_from_list(c, err, errlen);
 	if (r < 0)
@@ -742,49 +887,63 @@ int config_resolve(struct config *c, char *err, size_t errlen)
 	nbr = c->nbr;
 	c->nbr = 0;
 	for (i = 0; i < nbr; i++) {
-		int b = c->nbr, k;
+		int b = c->nbr;
 
 		c->br[b] = br[i];
 		c->nbr++;
 		r = scan_bridge(c, b, err, errlen);
 		if (r < 0)
 			return -1;
-		if (r > 0) {
+		if (r > 0)
 			c->nbr--;
-			continue;
-		}
-		for (k = 0; k < c->nport; k++) {
-			struct port *p = &c->port[k];
-
-			if (p->bridge != b || p->role != ROLE_CLIENT)
-				continue;
-			p->o82.mtu = c->mtu;
-			p->o82.type_mask = c->type_mask;
-			if (expand(c, c->circuit_id, p, p->o82.cid,
-				   &p->o82.cid_len) < 0 || !p->o82.cid_len) {
-				snprintf(err, errlen, "bad circuit_id for %s",
-					 p->name);
-				return -1;
-			}
-			if (!strcmp(c->remote_id, "none") || !c->remote_id[0])
-				p->o82.rid_len = 0;
-			else if (expand(c, c->remote_id, p, p->o82.rid,
-					&p->o82.rid_len) < 0) {
-				snprintf(err, errlen, "bad remote_id for %s",
-					 p->name);
-				return -1;
-			}
-			if (p->o82.cid_len + p->o82.rid_len + 4 > 255) {
-				snprintf(err, errlen,
-					 "circuit_id + remote_id too long");
-				return -1;
-			}
-		}
 	}
 	if (!c->nbr) {
 		snprintf(err, errlen, "no bridge with both a client (%s) and an "
 			 "uplink (%s) port", c->client_prefix, c->uplink_prefix);
 		return -1;
+	}
+	return 0;
+}
+
+int config_resolve(struct config *c, char *err, size_t errlen)
+{
+	int k, r;
+
+	c->nbr = 0;
+	c->nport = 0;
+	if (system_hostname(c->system_cfg, c->hostname,
+			    sizeof(c->hostname)) < 0) {
+		snprintf(err, errlen, "cannot determine hostname");
+		return -1;
+	}
+	r = c->nxport ? explicit_ports(c, err, errlen)
+		      : auto_ports(c, err, errlen);
+	if (r < 0)
+		return -1;
+
+	for (k = 0; k < c->nport; k++) {
+		struct port *p = &c->port[k];
+
+		if (p->role != ROLE_CLIENT)
+			continue;
+		p->o82.mtu = c->mtu;
+		p->o82.type_mask = c->type_mask;
+		if (expand(c, c->circuit_id, p, p->o82.cid,
+			   &p->o82.cid_len) < 0 || !p->o82.cid_len) {
+			snprintf(err, errlen, "bad circuit_id for %s", p->name);
+			return -1;
+		}
+		if (!strcmp(c->remote_id, "none") || !c->remote_id[0])
+			p->o82.rid_len = 0;
+		else if (expand(c, c->remote_id, p, p->o82.rid,
+				&p->o82.rid_len) < 0) {
+			snprintf(err, errlen, "bad remote_id for %s", p->name);
+			return -1;
+		}
+		if (p->o82.cid_len + p->o82.rid_len + 4 > 255) {
+			snprintf(err, errlen, "circuit_id + remote_id too long");
+			return -1;
+		}
 	}
 	return 0;
 }

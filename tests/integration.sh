@@ -119,7 +119,7 @@ worker_uid = 0
 EOF
 
 start_agent() {
-	"$BIN" -d -C "$W/agent.conf" > "$W/agent.log" 2>&1 &
+	"$BIN" -d -C "$W/agent.conf" "$@" > "$W/agent.log" 2>&1 &
 	AGENT=$!
 	sleep 1
 }
@@ -129,8 +129,10 @@ count() { grep -c "$1" "$2" 2>/dev/null || true; }
 
 # --- 1: full lease cycle through the agent --------------------------
 echo "1) DISCOVER/REQUEST/RENEW/REBIND through agent"
+# ports as a vendor UI would pass them; scenario 5 uses auto detection
 broute_on
-start_agent
+start_agent -u br1:eth0,br1:eth1 -t br1:ath0.1284
+expect "$(count 'ports explicit' "$W/agent.log")" 1 "agent uses the ports from the command line"
 ins $SIM server s0.1284 "$W/server1.log" 14 &
 SRV=$!
 sleep 0.5
@@ -256,6 +258,7 @@ expect "$(grep -c '"op": 1' "$W/server4.log" || true)" 0 "nothing leaks without 
 echo "5) agent running, no broute rules: bridge forwards exactly once"
 broute_off
 start_agent
+expect "$(count 'ports auto' "$W/agent.log")" 1 "agent detects the ports itself"
 ins $SIM sniff s0.1284 "$W/server5.log" 3 &
 SN=$!
 sleep 0.5

@@ -1,123 +1,172 @@
 # dhcp-snooping-82
 
-Transparenter DHCPv4-Option-82-Agent (RFC 3046) für Ubiquiti airOS 8
-(PowerBeam 5AC, WA.v8.7.11). Er ersetzt `/bin/dhcp-fwd` und versieht jedes
-DHCP-Clientpaket, das physisch auf einem Ethernet-Port ankommt, genau einmal
-mit Option 82. Das gilt auch für Unicast-Renews. Die Bridge bleibt sonst
-unverändert. Kein L3-Relay: `giaddr` bleibt 0, das setzt der Upstream-Relay.
+Transparent DHCPv4 option 82 agent (RFC 3046) for Ubiquiti airOS 8
+(PowerBeam 5AC, WA.v8.7.11). It replaces `/bin/dhcp-fwd` and adds option 82
+exactly once to every DHCP client packet that physically arrives on a customer
+port, including unicast renews. Apart from that the bridge is left unchanged.
+It is not an L3 relay: `giaddr` stays 0, the upstream relay sets it.
 
-* **Bridges:** automatisch alle, für die in `/tmp/system.cfg` das DHCP-Relay
-  eingeschaltet ist (`dhcprelay.client.N.devname`).
-* **Ports:** jeder Bridge-Member wird nach dem physischen Interface unter
-  eventuellen VLANs eingeordnet: `eth*` = untrusted Kundenport, `ath*` =
-  Uplink. So funktionieren `eth0`, `eth0.100`, `ath0`, `ath0.1284`, auch
-  mehrere Ethernet-Ports. Andere Member (z. B. `gre0`) bleiben unberührt.
-* **Circuit-ID** `<hostname>/<bridge>:<port>`, z. B. `cust-example/br1:eth0`;
-  **Remote-ID** = MAC der Bridge als Hex-Text. Beides über Templates änderbar.
-* **DHCP-Snooping:** DHCP-Server am Kundenport und Requests fremder Kunden vom
-  Uplink werden verworfen. Die airOS-FIREWALL-Regeln braucht es nicht.
+* **Bridges:** all bridges with the DHCP relay enabled in `/tmp/system.cfg`
+  (`dhcprelay.client.N.devname`), or the ports given with `-u`/`-t`.
+* **Ports:** each bridge member is classified by the physical interface below
+  any VLANs: `eth*` = untrusted customer port, `ath*` = trusted uplink. This
+  covers `eth0`, `eth0.100`, `ath0`, `ath0.1284` and several Ethernet ports.
+  Other members (e.g. `gre0`) are left alone.
+* **Circuit ID** `<hostname>/<bridge>:<port>`, e.g. `cust-example/br1:eth0`;
+  **remote ID** = bridge MAC as hex text. Both can be changed with templates.
+* **DHCP snooping:** DHCP servers on a customer port and requests of other
+  customers arriving from the uplink are dropped. The airOS FIREWALL rules for
+  this are not needed.
 
-Ist-Analyse und Architektur: [docs/ANALYSIS.md](docs/ANALYSIS.md).
-Lizenz: MIT ([LICENSE](LICENSE)).
+Analysis and architecture: [docs/ANALYSIS.md](docs/ANALYSIS.md) (German).
+License: MIT ([LICENSE](LICENSE)).
 
 ## Build
 
 ```sh
-make toolchain      # Zig 0.13.0 (clang + musl), SHA256 geprüft, nach .toolchain/
-make                # build/mips/dhcp-fwd: statisch, MIPS32r2 BE, soft-float
-make test           # Unit-Tests (ASan/UBSan, Fuzzing), tshark-Prüfung, Port-Erkennung
-make integration    # Bridge-Simulation in Netz-Namensräumen, ohne root
+make toolchain      # Zig 0.13.0 (clang + musl), SHA256 verified, into .toolchain/
+make                # build/mips/dhcp-fwd: static, MIPS32r2 BE, soft-float
+make test           # unit tests (ASan/UBSan, fuzzing), tshark check, port detection
+make integration    # bridge simulation in network namespaces, no root needed
 make dist           # build/dist/dhcp-snooping-82-<ver>.tar.gz
 ```
 
-Der Build ist reproduzierbar: gleiche Quellen ergeben bitgleiche Binaries,
-die SHA256 steht in `build/mips/dhcp-fwd.sha256`.
+The build is reproducible: the same sources give a bit-identical binary, its
+SHA256 is written to `build/mips/dhcp-fwd.sha256`.
 
-## Installation (ein Testgerät, Schritt für Schritt)
+## Command line
+
+The binary is a drop-in replacement for the airOS `dhcp-fwd`: init starts it
+as `/bin/dhcp-fwd -n -c /etc/dhcp-fwd.conf`, and the airOS config given with
+`-c` is ignored unless it uses our INI syntax. Without further options the
+agent detects bridges and ports itself as described above.
+
+A UI that knows which ports are trusted can pass them explicitly instead:
 
 ```sh
-# vom PC
-scp build/mips/dhcp-fwd scripts/dhcp-snooping-82.sh etc/dhcp-snooping-82.conf root@GERÄT:/tmp/
-# auf dem Gerät
-sh /tmp/dhcp-snooping-82.sh install            # nach /etc/persistent/dhcp-snooping-82, prüft Binary
-/etc/persistent/dhcp-snooping-82/dhcp-fwd --check     # erkannte Bridges, Ports, IDs
-/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh diag 120   # passiv, sendet nichts
-/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh activate   # Health-Check, sonst Rollback
+dhcp-fwd -n -u br1:eth0 -t br1:ath0.1284
+dhcp-fwd -n -u br1:eth0,br1:eth1 -t br1:ath0 -u br2:eth0.100 -t br2:ath0.200 \
+         -i '%h/%b:%p' -r '%m'
+```
+
+| Option | Meaning |
+|---|---|
+| `-u`, `--untrusted BRIDGE:PORT[,...]` | customer port: option 82 is added to requests, DHCP servers are blocked |
+| `-t`, `--trusted BRIDGE:PORT[,...]` | uplink port towards the DHCP server |
+| `-i`, `--circuit-id TEMPLATE` | circuit ID (sub-option 1), default `%h/%b:%p` |
+| `-r`, `--remote-id TEMPLATE` | remote ID (sub-option 2), default `%m`, `none` omits it |
+| `-o`, `--option SECTION.KEY=VALUE` | any key of the configuration file, e.g. `-o snooping.block_client_servers=false` |
+| `-C FILE` | own configuration file (default `/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.conf`) |
+| `-n` / `-d` | foreground / foreground with debug log on stderr |
+| `--check`, `--status`, `--diag [s]` | print the resolved configuration / counters and rule state / passive packet path diagnosis |
+
+Templates: `%h` hostname (`resolv.host.1.name`), `%b` bridge, `%p` port,
+`%m` bridge MAC, `%M` port MAC (MACs as 12 hex digits), `%%` percent sign.
+
+Rules for explicit ports:
+
+* If any `-u`/`-t` (or `[interface] untrusted`/`trusted` in the file) is
+  given, exactly these ports are used. The relay settings in `system.cfg` and
+  the name based classification are not consulted; any bridge member can be
+  either role.
+* Every bridge needs at least one trusted and one untrusted port. Ports that
+  are not listed are left alone.
+* A port must be a member of the bridge. If it is not (yet), the agent logs
+  the error and retries every 10 s instead of exiting, so init does not
+  respawn it in a tight loop.
+* Precedence: defaults, then the configuration file, then the command line.
+  The command line options also apply after a `SIGHUP` reload.
+* `--check` and `--status` resolve the configuration the same way, so pass
+  them the same options as the running agent.
+
+## Installation (one test device, step by step)
+
+```sh
+# on the PC
+scp build/mips/dhcp-fwd scripts/dhcp-snooping-82.sh etc/dhcp-snooping-82.conf root@DEVICE:/tmp/
+# on the device
+sh /tmp/dhcp-snooping-82.sh install            # to /etc/persistent/dhcp-snooping-82, checks the binary
+/etc/persistent/dhcp-snooping-82/dhcp-fwd --check     # detected bridges, ports, IDs
+/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh diag 120   # passive, sends nothing
+/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh activate   # health check, rollback on failure
 /etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh status
-# erst wenn alles passt, dauerhaft speichern:
+# only when everything works, save to flash:
 sh /etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh install --save
 ```
 
-Zurück zum Original: `dhcp-snooping-82.sh deactivate` (oder `rollback`, das sperrt
-zusätzlich `ensure` bis zum Reboot). Entfernen: `dhcp-snooping-82.sh uninstall --save`.
+`install` and `activate` also work while the relay is disabled in the UI. This
+is the recommended order: install and activate first, then enable the relay
+and press "Apply", so the original `dhcp-fwd` never runs in between.
 
-Im airOS-Webinterface schaltet der Schalter „DHCP Relay“ den Agent weiterhin
-ein und aus, denn init startet weiter `/bin/dhcp-fwd`.
+Back to the original: `dhcp-snooping-82.sh deactivate` (or `rollback`, which also
+blocks `ensure` until the next reboot). Remove: `dhcp-snooping-82.sh uninstall --save`.
 
-Update: neue Dateien nach `/tmp` kopieren, `sh /tmp/dhcp-snooping-82.sh install`,
-dann `dhcp-snooping-82.sh activate` (mountet das neue Binary und startet den Agent
-neu; die Konfiguration bleibt erhalten), zuletzt `install --save`.
+The "DHCP Relay" switch in the airOS web UI still turns the agent on and off,
+because init keeps starting `/bin/dhcp-fwd`.
 
-### Persistenz
+Update: copy the new files to `/tmp`, run `sh /tmp/dhcp-snooping-82.sh install`,
+then `dhcp-snooping-82.sh activate` (mounts the new binary and restarts the agent;
+the configuration is kept), finally `install --save`.
 
-`install` trägt in `/etc/persistent/rc.poststart` einen Aufruf von
-`dhcp-snooping-82.sh ensure` ein (Zeile mit `# dhcp-snooping-82` markiert, `uninstall`
-entfernt sie wieder). Diesen Boot-Hook führt nur **CS-Firmware** aus. Die
-Standard-Firmware führt beim Boot **keine** Custom-Scripts aus
-(`rc.poststart` nur bei vorhandenem `/etc/poststart`, das nur CS-Firmware
-anlegt). Dort läuft nach einem Reboot zunächst das Original, bis
-`dhcp-snooping-82.sh ensure` aufgerufen wird, z. B. durch die Device-Discovery per
+### Persistence
+
+`install` adds a call of `dhcp-snooping-82.sh ensure` to
+`/etc/persistent/rc.poststart` (the line is tagged `# dhcp-snooping-82`; `uninstall`
+removes it). Only **CS firmware** runs this boot hook. The standard firmware
+runs **no** custom scripts at boot (`rc.poststart` only if `/etc/poststart`
+exists, which only CS firmware creates). There the original runs after a
+reboot until `dhcp-snooping-82.sh ensure` is called, e.g. by a device discovery over
 SSH:
 
 ```sh
-ssh root@GERÄT '/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh ensure'
+ssh root@DEVICE '/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh ensure'
 ```
 
-## Betrieb und Diagnose
+## Operation and diagnosis
 
 ```sh
-dhcp-snooping-82.sh status                     # Modus, Prozesse, Zähler, Regeln
-cat /var/run/dhcp-snooping-82.stats            # Zähler (alle 10 s aktualisiert)
-grep dhcp-fwd /var/log/messages          # Log (RAM), ein Eintrag pro Paket
-kill -HUP $(cat /var/run/dhcp-fwd.pid)   # Konfiguration neu laden
+dhcp-snooping-82.sh status                     # mode, processes, counters, rules
+cat /var/run/dhcp-snooping-82.stats            # counters (updated every 10 s)
+grep dhcp-fwd /var/log/messages          # log (RAM), one line per packet
+kill -HUP $(cat /var/run/dhcp-fwd.pid)   # reload the configuration
 
-# Paketpfad
+# packet path
 tcpdump -i eth0      -e -n -vvv -s0 'udp port 67 or udp port 68'
 tcpdump -i ath0.1284 -e -n -vvv -s0 'udp port 67 or udp port 68'
-dhcp-fwd --diag 60                       # zeigt pro Socket: ALL = alles, IP = nur ausgeleitet
+dhcp-fwd --diag 60                       # per socket: ALL = everything, IP = diverted only
 
-# Regeln
-ebtables -t broute -L --Lc               # Sprung nach DHCP_SNOOPING_82 an Position 1
-ebtables -t broute -L DHCP_SNOOPING_82 --Lc    # Zähler = ausgeleitete DHCP-Frames
-ebtables -L --Lc                         # airOS-Filter; FIREWALL-DHCP-Regeln werden nicht mehr gebraucht
+# rules
+ebtables -t broute -L --Lc               # jump to DHCP_SNOOPING_82 at position 1
+ebtables -t broute -L DHCP_SNOOPING_82 --Lc    # counters = diverted DHCP frames
+ebtables -L --Lc                         # airOS filter; FIREWALL DHCP rules no longer needed
 
-# Prozesse
-pidof dhcp-fwd; grep " /bin/dhcp-fwd " /proc/mounts
+# processes
+pidof dhcp-fwd; grep " /bin/dhcp-fwd" /proc/mounts
 ls -l /proc/$(cat /var/run/dhcp-fwd.pid)/fd; cat /proc/net/packet
 ```
 
-Logzeile, Beispiel:
+Example log line:
 
 ```
 req-mark if=eth0/2 to=ath0.1284 type=REQUEST xid=0x30336d42 chaddr=1c:ed:6f:00:00:01 src=1c:ed:6f:00:00:01/198.51.100.175
   dst=dc:9f:db:00:00:01/198.51.100.0 giaddr=0.0.0.0 hops=0 reason=inserted cid="cust-example/br1:eth0" rid="00005e005301"
 ```
 
-## Verhalten
+## Behaviour
 
-| Fall | Aktion |
+| Case | Action |
 |---|---|
-| Client-Paket von einem Kundenport, ohne Option 82 | Option 82 in den PAD-Bereich, sonst Paket bis MTU vergrößern; einmal auf den Uplink derselben Bridge senden |
-| bereits Option 82 / `giaddr` / `hops` | unverändert weiterleiten (`existing_option82 = forward`) |
-| fehlerhaft, Fragment, falsche Prüfsumme | unverändert weiterleiten, Zähler `req_malformed` |
-| Antwort mit eigener Option 82 | Option 82 entfernen (Länge bleibt, PAD), nur an den Kundenport, zu dem die Circuit-ID gehört |
-| Antwort mit fremder Option 82 zu einem von uns markierten Request (xid + chaddr) | Upstream hat unsere Option 82 ersetzt: Option 82 entfernen, an eth0 (`rep_foreign_ours_by_xid`) |
-| Antwort mit fremder Option 82, durchgereichter Request | unverändert an eth0 |
-| sonstige Antwort mit fremder Option 82 | verwerfen (andere Station) |
-| Antwort ohne Option 82 | an den Port, von dem der Request kam (xid), sonst an alle Kundenports der Bridge |
-| DHCP-Request vom Uplink (Kunden anderer Stationen) | verworfen (Snooping, `block_uplink_requests`) |
-| DHCP-Server-Antwort von eth0 (Server beim Kunden) | verworfen (Snooping, `block_client_servers`) |
-| BOOTREPLY an Port 67 von eth0 / BOOTREQUEST an Port 68 vom Uplink | verworfen |
-| Worker abgestürzt | Regeln bleiben (fail-closed), Neustart mit Backoff |
-| airOS löscht Regeln (Apply) | innerhalb von 5 s neu gesetzt; dazwischen gilt das airOS-Verhalten, ohne Duplikate |
-| SIGTERM (Relay im Webinterface aus, deactivate) | Regeln entfernen, beenden |
+| client packet from a customer port without option 82 | insert option 82 into the PAD area, otherwise grow the packet up to the MTU; send it once to the uplink of the same bridge |
+| already has option 82 / `giaddr` / `hops` | forward unchanged (`existing_option82 = forward`) |
+| malformed, fragment, bad checksum | forward unchanged, counter `req_malformed` |
+| reply with our own option 82 | strip option 82 (length kept, PAD), send only to the customer port the circuit ID belongs to |
+| reply with foreign option 82 to a request we marked (xid + chaddr) | upstream replaced our option 82: strip it, send to the request's port (`rep_foreign_ours_by_xid`) |
+| reply with foreign option 82 to a request we passed through | forward unchanged to the request's port |
+| any other reply with foreign option 82 | drop (another station) |
+| reply without option 82 | to the port the request came from (xid), otherwise to all customer ports of the bridge |
+| DHCP request from the uplink (customers of other stations) | dropped (snooping, `block_uplink_requests`) |
+| DHCP server reply from a customer port (server at the customer) | dropped (snooping, `block_client_servers`) |
+| BOOTREPLY to port 67 from a customer port / BOOTREQUEST to port 68 from the uplink | dropped |
+| worker crashed | rules stay (fail-closed), restart with backoff |
+| airOS removes the rules (Apply) | re-installed within 5 s; until then the airOS behaviour applies, without duplicates |
+| SIGTERM (relay switched off in the UI, deactivate) | remove rules, exit |

@@ -71,7 +71,8 @@ EOF
 check() {	# name, expected lines (grep -F each)
 	name=$1
 	shift
-	out=$("$BIN" -C "$W/agent.conf" --check 2>&1) || true
+	# shellcheck disable=SC2086
+	out=$("$BIN" -C "$W/agent.conf" ${ARGS:-} --check 2>&1) || true
 	for want in "$@"; do
 		if printf '%s\n' "$out" | grep -qF -- "$want"; then :; else
 			echo "  FAIL $name: missing: $want"
@@ -126,6 +127,52 @@ echo "detect: relay disabled globally"
 sed -i 's/^dhcprelay.status=enabled/dhcprelay.status=disabled/' "$W/system.cfg"
 conf ""
 check "refuses to run" 'DHCP relay not enabled'
+
+echo "explicit: ports from the command line (relay still disabled)"
+ARGS="-u br1:eth0 -t br1:ath0.1284"
+check "-u/-t without system.cfg relay settings" \
+	'ports           explicit' \
+	'port            br1/eth0 client (lower eth0) circuit_id="cust-example/br1:eth0" remote_id="00005e005321"' \
+	'port            br1/ath0.1284 uplink (lower ath0)'
+refute "only the given bridge" 'bridge          br2'
+ARGS="--untrusted br2:eth1,br2:eth0.100 --trusted br2:ath0.200 --circuit-id %p@%h --remote-id none"
+check "lists, long options, templates" \
+	'port            br2/eth1 client (lower eth1) circuit_id="eth1@cust-example" remote_id=""' \
+	'port            br2/eth0.100 client (lower eth0) circuit_id="eth0.100@cust-example"' \
+	'port            br2/ath0.200 uplink (lower ath0)'
+refute "unlisted member gre0 left alone" 'gre0'
+ARGS="-u br2:gre0 -t br2:ath0.200"
+check "any member can be untrusted" 'port            br2/gre0 client (lower gre0)'
+ARGS="-u br1:eth1 -t br1:ath0.1284"
+check "port not in bridge" 'eth1 is not a port of br1'
+ARGS="-u br1:eth0"
+check "bridge without trusted port" 'bridge br1 needs at least one trusted and one untrusted port'
+ARGS="-u br9:eth0 -t br9:ath0"
+check "unknown bridge" 'bridge br9 not found'
+ARGS="-u eth0 -t br1:ath0.1284"
+check "missing bridge name" 'invalid value for interface.untrusted: eth0'
+ARGS="-u br1:eth0 -t br1:eth0"
+check "port with two roles" 'invalid value for interface.trusted: br1:eth0'
+ARGS="-u br1:eth0 -t br1:ath0.1284 -o snooping.block_client_servers=false -o logging.level=debug"
+check "-o sets any key" 'snooping        client_servers=allowed uplink_requests=blocked'
+ARGS="-o nosuch.key=1"
+check "-o unknown key" 'unknown option nosuch.key'
+ARGS="-o foo"
+check "-o without value" 'expected SECTION.KEY=VALUE'
+
+echo "explicit: ports from the config file, command line wins"
+ARGS=""
+conf "[interface]
+untrusted = br1:eth0
+trusted = br1:ath0.1284
+[option82]
+circuit_id = from-file"
+check "[interface] untrusted/trusted" \
+	'port            br1/eth0 client (lower eth0) circuit_id="from-file"'
+ARGS="-i from-cli"
+check "-i overrides the file" \
+	'port            br1/eth0 client (lower eth0) circuit_id="from-cli"'
+ARGS=""
 
 [ "$fail" = 0 ] && echo "detect: PASS" || echo "detect: FAIL"
 exit $fail

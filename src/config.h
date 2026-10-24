@@ -27,6 +27,13 @@ struct bridge {
 	uint8_t		mac[6];
 };
 
+/* port given explicitly (--untrusted/--trusted, [interface] untrusted/trusted) */
+struct xport {
+	char		bridge[IFNAMSIZ];
+	char		name[IFNAMSIZ];
+	int		role;
+};
+
 struct port {
 	char		name[IFNAMSIZ];
 	char		lower[IFNAMSIZ];	/* physical device below VLANs */
@@ -43,6 +50,9 @@ struct config {
 	/* auto classification by the physical device below VLANs */
 	char		client_prefix[64];
 	char		uplink_prefix[64];
+	/* explicit ports; if any is given, auto detection is off */
+	struct xport	xport[MAX_PORTS];
+	int		nxport;
 
 	/* templates: %h hostname, %b bridge, %p port, %m bridge MAC,
 	 * %M port MAC (MACs as 12 lower case hex digits), %% percent */
@@ -89,6 +99,9 @@ void config_defaults(struct config *c);
 int config_load(struct config *c, const char *path, char *err, size_t errlen);
 /* detects bridges and ports, expands the ids; 0 or -1 with err */
 int config_resolve(struct config *c, char *err, size_t errlen);
+/* sets one option, name is "section.key"; 0 or -1 with message in err */
+int config_set(struct config *c, const char *name, const char *val,
+	       char *err, size_t errlen);
 /* returns 1 if the file looks like our INI syntax (has a [section]) */
 int config_is_ours(const char *path);
 const char *role_str(int role);
