@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <grp.h>
+#include <limits.h>
 #include <linux/filter.h>
 #include <net/if.h>
 #include <netpacket/packet.h>
@@ -57,6 +58,7 @@ static volatile sig_atomic_t sig_stop, sig_hup, sig_usr1, sig_chld;
 
 static struct config cfg;
 static const char *own_cfg_path = DEFAULT_CONFIG;
+static char abs_cfg_path[PATH_MAX];
 
 /* ------------------------------------------------------------------ */
 
@@ -1096,6 +1098,9 @@ int main(int argc, char **argv)
 	 * written in our syntax */
 	if (airos_cfg && config_is_ours(airos_cfg))
 		own_cfg_path = airos_cfg;
+	/* the daemon changes to / and SIGHUP reloads by path */
+	if (realpath(own_cfg_path, abs_cfg_path))
+		own_cfg_path = abs_cfg_path;
 
 	config_defaults(&cfg);
 	if (access(own_cfg_path, R_OK) == 0 &&
