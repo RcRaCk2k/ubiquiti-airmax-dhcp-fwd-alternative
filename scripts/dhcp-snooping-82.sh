@@ -42,7 +42,8 @@ log() {
 
 die() { log "ERROR: $*"; exit 1; }
 
-is_active() { grep -q " $TARGET " /proc/mounts; }
+# after "install" replaced the binary the entry reads "/bin/dhcp-fwd\040(deleted)"
+is_active() { grep -q " $TARGET[ \\]" /proc/mounts; }
 
 relay_enabled() { grep -q '^dhcprelay.status=enabled' /tmp/system.cfg; }
 
