@@ -56,12 +56,21 @@ test: $(BUILD)/test_dhcp host
 toolchain:
 	sh tools/fetch-toolchain.sh
 
+# release assets: tarball (binary, script, config, docs) plus the bare
+# binary, both listed in SHA256SUMS; reproducible like the binary itself
+DIST_NAME := dhcp-snooping-82-$(VERSION)
 dist: mips
-	@rm -rf $(BUILD)/dist && mkdir -p $(BUILD)/dist/dhcp-snooping-82
-	cp $(MIPS_BIN) scripts/dhcp-snooping-82.sh etc/dhcp-snooping-82.conf $(BUILD)/dist/dhcp-snooping-82/
+	@rm -rf $(BUILD)/dist && mkdir -p $(BUILD)/dist/$(DIST_NAME)
+	cp $(MIPS_BIN) scripts/dhcp-snooping-82.sh etc/dhcp-snooping-82.conf \
+		README.md LICENSE $(BUILD)/dist/$(DIST_NAME)/
+	cd $(BUILD)/dist/$(DIST_NAME) && sha256sum dhcp-fwd dhcp-snooping-82.sh \
+		dhcp-snooping-82.conf > SHA256SUMS
 	cd $(BUILD)/dist && tar --owner=0 --group=0 --mtime=@0 --sort=name \
-		-czf dhcp-snooping-82-$(VERSION).tar.gz dhcp-snooping-82
-	@sha256sum $(BUILD)/dist/dhcp-snooping-82-$(VERSION).tar.gz
+		-cf - $(DIST_NAME) | gzip -9n > $(DIST_NAME)-mips.tar.gz
+	cp $(MIPS_BIN) $(BUILD)/dist/dhcp-fwd-$(VERSION)-mips
+	cd $(BUILD)/dist && sha256sum $(DIST_NAME)-mips.tar.gz \
+		dhcp-fwd-$(VERSION)-mips > SHA256SUMS
+	@cat $(BUILD)/dist/SHA256SUMS
 
 clean:
 	rm -rf $(BUILD)

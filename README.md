@@ -28,7 +28,7 @@ make toolchain    # Zig 0.13.0 (clang + musl), SHA256 verified, into .toolchain/
 make              # build/mips/dhcp-fwd: static, MIPS32r2 BE, soft-float
 make test         # unit tests (ASan/UBSan, fuzzing), tshark check, port detection
 make integration  # bridge simulation in network namespaces, no root needed
-make dist         # build/dist/dhcp-snooping-82-<ver>.tar.gz
+make dist         # build/dist/: release tarball, bare binary, SHA256SUMS
 ```
 
 The build is reproducible: the same sources give a bit-identical binary, its
