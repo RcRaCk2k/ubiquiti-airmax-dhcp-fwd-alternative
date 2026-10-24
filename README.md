@@ -54,13 +54,20 @@ zusätzlich `ensure` bis zum Reboot). Entfernen: `dhcp-snooping-82.sh uninstall 
 Im airOS-Webinterface schaltet der Schalter „DHCP Relay“ den Agent weiterhin
 ein und aus, denn init startet weiter `/bin/dhcp-fwd`.
 
+Update: neue Dateien nach `/tmp` kopieren, `sh /tmp/dhcp-snooping-82.sh install`,
+dann `dhcp-snooping-82.sh activate` (mountet das neue Binary und startet den Agent
+neu; die Konfiguration bleibt erhalten), zuletzt `install --save`.
+
 ### Persistenz
 
-Die Standard-Firmware führt beim Boot **keine** Custom-Scripts aus
+`install` trägt in `/etc/persistent/rc.poststart` einen Aufruf von
+`dhcp-snooping-82.sh ensure` ein (Zeile mit `# dhcp-snooping-82` markiert, `uninstall`
+entfernt sie wieder). Diesen Boot-Hook führt nur **CS-Firmware** aus. Die
+Standard-Firmware führt beim Boot **keine** Custom-Scripts aus
 (`rc.poststart` nur bei vorhandenem `/etc/poststart`, das nur CS-Firmware
-anlegt). Nach einem Reboot läuft daher zunächst das Original, bis
-`dhcp-snooping-82.sh ensure` aufgerufen wird. Vorgesehen ist der Aufruf durch die
-Device-Discovery per SSH:
+anlegt). Dort läuft nach einem Reboot zunächst das Original, bis
+`dhcp-snooping-82.sh ensure` aufgerufen wird, z. B. durch die Device-Discovery per
+SSH:
 
 ```sh
 ssh root@GERÄT '/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh ensure'

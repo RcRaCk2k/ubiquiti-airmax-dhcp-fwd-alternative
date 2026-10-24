@@ -9,10 +9,10 @@
 # "/bin/dhcp-fwd" as before, so the DHCP relay switch in the web UI still
 # enables/disables the agent.
 #
-# Standard airOS 8.7 firmware runs no custom boot scripts (rc.poststart is
-# only sourced if /etc/poststart exists, which only CS firmware creates).
-# After a reboot the original dhcp-fwd runs until "ensure" is called again,
-# e.g. by the management system over SSH.
+# Boot: "install" adds an "ensure" line to /etc/persistent/rc.poststart.
+# Only CS (custom script) firmware runs it; standard airOS 8.7 firmware runs
+# no custom boot scripts, so there the original dhcp-fwd runs after a reboot
+# until "ensure" is called, e.g. by the management system over SSH.
 #
 #   dhcp-snooping-82.sh install [--save]  copy files from this directory to
 #                                   /etc/persistent/dhcp-snooping-82
@@ -31,6 +31,8 @@ TARGET=/bin/dhcp-fwd
 MARKER=/var/run/dhcp-snooping-82.rolledback
 LOG=/var/log/dhcp-snooping-82.log
 HEALTH_WAIT=15
+POSTSTART=/etc/persistent/rc.poststart
+HOOK_TAG="# dhcp-snooping-82"
 
 log() {
 	echo "$*"
@@ -49,6 +51,23 @@ save_flash() {
 	cfgmtd -w -p /etc/ || die "cfgmtd failed"
 }
 
+install_hook() {
+	grep -q "$HOOK_TAG\$" "$POSTSTART" 2>/dev/null && return 0
+	[ -f "$POSTSTART" ] || echo '#!/bin/sh' > "$POSTSTART" || die "write $POSTSTART"
+	# background: the health check must not delay the rest of the boot
+	echo "$DIR/dhcp-snooping-82.sh ensure >/dev/null 2>&1 & $HOOK_TAG" >> "$POSTSTART" ||
+		die "write $POSTSTART"
+	chmod 755 "$POSTSTART"
+}
+
+remove_hook() {
+	[ -f "$POSTSTART" ] || return 0
+	sed -i "/$HOOK_TAG\$/d" "$POSTSTART"
+	# drop the file if only the shebang is left
+	[ "$(grep -cv '^#!' "$POSTSTART")" = 0 ] && rm -f "$POSTSTART"
+	return 0
+}
+
 cmd_install() {
 	src=$(cd "$(dirname "$0")" && pwd)
 	[ -f "$src/dhcp-fwd" ] || die "no dhcp-fwd binary next to $0"
@@ -62,6 +81,7 @@ cmd_install() {
 	chmod 755 "$BIN" "$DIR/dhcp-snooping-82.sh"
 	"$BIN" -v >/dev/null 2>&1 || die "binary does not run on this device"
 	self_check || die "configuration check failed"
+	install_hook
 	log "installed to $DIR ($("$BIN" -v))"
 	[ "${1:-}" = "--save" ] && save_flash
 	return 0
@@ -88,6 +108,10 @@ cmd_activate() {
 	[ -x "$BIN" ] || die "not installed"
 	self_check || die "binary self check failed, staying on original"
 	relay_enabled || log "WARNING: DHCP relay disabled in airOS, agent will not be started by init"
+	# "install" replaces the binary with a new file: mount that one
+	if is_active && ! [ "$BIN" -ef "$TARGET" ]; then
+		umount -l "$TARGET" || die "umount of old binary failed"
+	fi
 	if ! is_active; then
 		mount -o bind "$BIN" "$TARGET" || die "bind mount failed"
 	fi
@@ -141,6 +165,7 @@ cmd_status() {
 
 cmd_uninstall() {
 	cmd_deactivate
+	remove_hook
 	rm -rf "$DIR"
 	log "uninstalled"
 	[ "${1:-}" = "--save" ] && save_flash
