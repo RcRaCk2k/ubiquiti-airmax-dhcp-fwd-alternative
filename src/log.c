@@ -3,12 +3,17 @@
  *
  * Logs go to syslog (busybox syslogd keeps them in RAM) and optionally to
  * stderr. Nothing is ever written to flash.
+ *
+ * musl's syslog() always stamps messages in UTC. We write to /dev/log
+ * ourselves without a timestamp; busybox syslogd then adds its own in
+ * local time, like for every other airOS daemon.
  */
-#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
@@ -19,40 +24,53 @@
 
 static int cur_level = LOG_LVL_INFO;
 static int use_stderr;
+static int log_fd = -1;
 static time_t pkt_window;
 static unsigned pkt_count, pkt_suppressed;
 
-/* uClibc reads /etc/TZ, musl only $TZ: take the airOS zone from there so
- * syslog timestamps match the rest of the system */
-static void init_tz(void)
+static int log_connect(void)
 {
-	char buf[64];
-	ssize_t n;
-	int fd;
+	struct sockaddr_un sa = { .sun_family = AF_UNIX, .sun_path = "/dev/log" };
 
-	if (getenv("TZ"))
+	if (log_fd < 0)
+		log_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (log_fd < 0)
+		return -1;
+	if (connect(log_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		close(log_fd);
+		log_fd = -1;
+		return -1;
+	}
+	return 0;
+}
+
+/* syslogd restarts on every airOS "Apply": reconnect once on failure */
+static void log_send(int prio, const char *msg)
+{
+	char buf[600];
+	int n, i;
+
+	n = snprintf(buf, sizeof(buf), "<%d>dhcp-fwd[%d]: %s",
+		     LOG_DAEMON | prio, (int)getpid(), msg);
+	if (n < 0)
 		return;
-	fd = open("/etc/TZ", O_RDONLY);
-	if (fd < 0)
-		return;
-	n = read(fd, buf, sizeof(buf) - 1);
-	close(fd);
-	if (n <= 0)
-		return;
-	buf[n] = '\0';
-	buf[strcspn(buf, "\r\n")] = '\0';
-	if (buf[0]) {
-		setenv("TZ", buf, 1);
-		tzset();
+	if ((size_t)n >= sizeof(buf))
+		n = sizeof(buf) - 1;
+	for (i = 0; i < 2; i++) {
+		if (log_fd < 0 && log_connect() < 0)
+			continue;
+		if (send(log_fd, buf, (size_t)n, MSG_NOSIGNAL) >= 0)
+			return;
+		close(log_fd);
+		log_fd = -1;
 	}
 }
 
 void log_init(int level, int to_stderr)
 {
-	init_tz();
 	cur_level = level;
 	use_stderr = to_stderr;
-	openlog("dhcp-fwd", LOG_PID, LOG_DAEMON);
+	log_connect();
 }
 
 void log_set_level(int level)
@@ -72,7 +90,7 @@ static void vlog(int level, const char *fmt, va_list ap)
 	char buf[512];
 
 	vsnprintf(buf, sizeof(buf), fmt, ap);
-	syslog(prio[level], "%s", buf);
+	log_send(prio[level], buf);
 	if (use_stderr)
 		fprintf(stderr, "%s: %s\n", tag[level], buf);
 }
