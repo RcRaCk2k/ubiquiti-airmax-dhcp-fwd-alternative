@@ -60,10 +60,18 @@ cmd_install() {
 			die "copy config"
 	fi
 	chmod 755 "$BIN" "$DIR/dhcp-snooping-82.sh"
-	"$BIN" --check >/dev/null 2>&1 || die "binary does not run on this device"
+	"$BIN" -v >/dev/null 2>&1 || die "binary does not run on this device"
+	self_check || die "configuration check failed"
 	log "installed to $DIR ($("$BIN" -v))"
 	[ "${1:-}" = "--save" ] && save_flash
 	return 0
+}
+
+# --check needs a bridge with the relay enabled; without one init does not
+# start dhcp-fwd at all, so only the binary itself can be checked
+self_check() {
+	relay_enabled || { "$BIN" -v >/dev/null 2>&1; return; }
+	"$BIN" --check >/dev/null 2>&1
 }
 
 health_check() {
@@ -78,7 +86,7 @@ health_check() {
 
 cmd_activate() {
 	[ -x "$BIN" ] || die "not installed"
-	"$BIN" --check >/dev/null 2>&1 || die "binary self check failed, staying on original"
+	self_check || die "binary self check failed, staying on original"
 	relay_enabled || log "WARNING: DHCP relay disabled in airOS, agent will not be started by init"
 	if ! is_active; then
 		mount -o bind "$BIN" "$TARGET" || die "bind mount failed"
