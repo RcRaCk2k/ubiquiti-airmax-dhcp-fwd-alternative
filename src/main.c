@@ -472,7 +472,13 @@ static int handle_uplink(int fd_in, int fd_out, int ifindex, time_t now,
 			st.rep_ours++;
 			break;
 		case R_REPLY_FOREIGN:
-			if ((e && e->kind == 2) || cfg.reply_foreign == POL_FORWARD) {
+			/* answer to a request we marked, but an upstream relay
+			 * replaced our option 82: still our customer, strip */
+			if (e && e->kind == 1 && dhcp_strip_o82(buf, len) == 0) {
+				v = VERDICT_FORWARD_MODIFIED;
+				st.rep_foreign_ours_by_xid++;
+			} else if ((e && e->kind == 2) ||
+				   cfg.reply_foreign == POL_FORWARD) {
 				v = VERDICT_FORWARD;
 				st.rep_foreign_forwarded++;
 			} else {

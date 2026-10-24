@@ -24,6 +24,7 @@
 	X(req_unanswered)	/* marked request expired unanswered */	\
 	X(rep_ours)		/* our option 82, stripped */		\
 	X(rep_foreign_dropped)						\
+	X(rep_foreign_ours_by_xid)	/* replaced upstream, stripped */	\
 	X(rep_foreign_forwarded)					\
 	X(rep_no_o82_forwarded)						\
 	X(rep_no_o82_dropped)						\

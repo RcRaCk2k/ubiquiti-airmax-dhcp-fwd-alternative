@@ -118,7 +118,12 @@ def recv_dhcp(s, until, want_op=None):
     return None, None
 
 
-def server(iface, log, seconds):
+# what a MikroTik bridge would put in if it replaced our option 82
+UPSTREAM_O82 = bytes([1, 23]) + b"sfp-sfpplus23.dach:1281" + \
+    bytes([2, 17]) + b"c4:ad:34:00:00:01"
+
+
+def server(iface, log, seconds, mode="echo"):
     s = open_sock(iface)
     end = time.time() + float(seconds)
     with open(log, "w") as out:
@@ -129,7 +134,9 @@ def server(iface, log, seconds):
             out.write(json.dumps(p) + "\n")
             out.flush()
             o82 = b""
-            if p["o82"] is not None:
+            if mode == "replace":
+                o82 = bytes([82, len(UPSTREAM_O82)]) + UPSTREAM_O82
+            elif p["o82"] is not None:
                 raw = bytes.fromhex(p["o82_raw"])
                 o82 = bytes([82, len(raw)]) + raw
             chaddr = bytes.fromhex(p["chaddr"])
@@ -214,7 +221,7 @@ def sniff(iface, log, seconds):
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "server":
-        server(*sys.argv[2:5])
+        server(*sys.argv[2:6])
     elif cmd == "client":
         client(*sys.argv[2:4])
     elif cmd == "send":

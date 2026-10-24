@@ -39,6 +39,18 @@ passiver Mitschnitt auf `eth0`, `ath0.1284` und `br1`.
    plus manueller Start aus `dhcp-option82.sh`). Die manuell gestartete wurde
    mit Freigabe beendet.
 
+5. **Passiver `--diag`-Lauf auf 2.6.32** (20:03, Renew `0x1628e223`): Den
+   Renew und das ACK sahen nur die `ETH_P_ALL`-Sockets auf eth0 und
+   ath0.1284, die `ETH_P_IP`-Sockets nichts. Damit ist auf dem Altkernel
+   belegt: Ohne broute-Regel erreicht ein gebridgter Frame den Agent nicht.
+   Die Gegenprobe (mit Regel) steht noch aus. Das statische Binary läuft
+   (108 KB RSS, 0 % CPU).
+6. **Der MikroTik fügt Option 82 auch auf dem trusted-Port ein**
+   (`trusted=yes`), mitten im Padding und ohne `giaddr` (beim Renew direkt
+   zum Server: `giaddr=0`). Der Server beantwortet so einen Renew trotz
+   `giaddr=0` und gibt die Option 82 zurück; der MikroTik entfernt sie auf dem
+   Rückweg nicht.
+
 ## Architektur dhcp-snooping-82 (Kurzfassung)
 
 * Eigener Agent (MIT), kein Code aus dhcp-fwd.
@@ -57,8 +69,13 @@ passiver Mitschnitt auf `eth0`, `ath0.1284` und `br1`.
   UDP-Prüfsumme 0 bleibt 0, `giaddr`/`hops`/`flags`/MAC/IP bleiben unverändert.
 * Bereits vorhandene Option 82, `giaddr` oder `hops` → unverändert
   weiterleiten (nie überschreiben).
-* Antworten: eigene Option 82 entfernen, fremde Option 82 verwerfen (außer zu
-  durchgereichten Requests), ohne Option 82 weiterleiten.
+* Antworten: eigene Option 82 entfernen. Fremde Option 82 bei passender
+  `xid`/`chaddr` eines von uns markierten Requests ebenfalls entfernen und
+  weiterleiten (falls der MikroTik unsere ersetzt). Bei durchgereichten
+  Requests unverändert weiterleiten, sonst verwerfen. Ohne Option 82
+  weiterleiten.
+* `giaddr` setzt der Agent nie, das macht der MikroTik-Relay mit seiner
+  öffentlichen IP.
 * Watcher setzt Regeln wieder ein, die airOS gelöscht hat (alle 5 s), und
   startet den Worker neu. Fail-closed: stirbt der Worker, bleiben die Regeln
   stehen.

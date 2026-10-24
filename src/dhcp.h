@@ -98,6 +98,11 @@ enum verdict dhcp_handle_reply(uint8_t *frame, size_t *len,
 			       const struct o82_cfg *cfg,
 			       struct dhcp_info *info);
 
+/* Removes the option 82 from the main option field of a reply whatever
+ * its content (frame length kept, PAD). Used for replies to requests we
+ * marked whose option 82 an upstream relay replaced. Returns 0 if stripped. */
+int dhcp_strip_o82(uint8_t *frame, size_t len);
+
 const char *dhcp_reason_str(enum reason r);
 const char *dhcp_type_str(uint8_t t);
 

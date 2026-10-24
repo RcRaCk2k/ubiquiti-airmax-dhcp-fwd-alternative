@@ -331,14 +331,22 @@ static int is_ours(const struct dhcp_info *info, const struct o82_cfg *cfg)
 	return 1;
 }
 
+/* remove option 82 from the main field, keep the length (PAD) */
+static void strip(struct parsed *p)
+{
+	size_t o = p->o82_off, l = 2u + p->b[o + 1];
+
+	memmove(p->b + o, p->b + o + l, p->blen - o - l);
+	memset(p->b + p->blen - l, 0, l);
+	fix_lengths_and_csums(p, p->blen, get16(p->udp + 6) != 0);
+}
+
 enum verdict dhcp_handle_reply(uint8_t *f, size_t *len,
 			       const struct o82_cfg *cfg,
 			       struct dhcp_info *info)
 {
 	struct parsed p;
-	size_t o, l;
-
-	(void)len;	/* length is kept, freed bytes become PAD */
+	/* length is kept, freed bytes become PAD */
 	info->reason = parse(f, *len, &p, info);
 	if (info->reason != R_PARSED)
 		return VERDICT_FORWARD;
@@ -356,13 +364,20 @@ enum verdict dhcp_handle_reply(uint8_t *f, size_t *len,
 		return VERDICT_DROP;
 	}
 
-	o = p.o82_off;
-	l = 2u + p.b[o + 1];
-	memmove(p.b + o, p.b + o + l, p.blen - o - l);
-	memset(p.b + p.blen - l, 0, l);
-	fix_lengths_and_csums(&p, p.blen, get16(p.udp + 6) != 0);
+	strip(&p);
 	info->reason = R_REPLY_OURS;
 	return VERDICT_FORWARD_MODIFIED;
+}
+
+int dhcp_strip_o82(uint8_t *f, size_t len)
+{
+	struct dhcp_info info;
+	struct parsed p;
+
+	if (parse(f, len, &p, &info) != R_PARSED || info.op != 2 || !p.o82_off)
+		return -1;
+	strip(&p);
+	return 0;
 }
 
 const char *dhcp_reason_str(enum reason r)

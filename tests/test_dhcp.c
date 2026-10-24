@@ -495,6 +495,13 @@ static void test_reply(void)
 	      info.reason == R_REPLY_FOREIGN);
 	CHECK(!memcmp(in, f, len));
 
+	/* upstream replaced our option 82: strip it anyway when asked */
+	len = reply_with_o82(f, (const uint8_t *)"sfp-sfpplus23.dach:1281", 23, 1);
+	CHECK(dhcp_strip_o82(f, len) == 0);
+	CHECK(dhcp_parse(f, len, &a) == R_PARSED && !a.has_o82);
+	pcap_write(pcap_out, f, len);
+	CHECK(dhcp_strip_o82(f, len) == -1);	/* nothing left to strip */
+
 	/* prefix of our id must not match */
 	len = reply_with_o82(f, cfg.cid, cfg.cid_len - 1, 0);
 	CHECK(dhcp_handle_reply(f, &len, &cfg, &info) == VERDICT_DROP);

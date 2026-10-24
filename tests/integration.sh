@@ -171,6 +171,23 @@ ins $SIM send s0 foreign-offer
 wait $SN
 expect "$(grep -c '"xid": 2882400001' "$W/client3.log" || true)" 0 "foreign offer filtered"
 
+# --- 3b: upstream replaced our option 82 in the reply ---------------
+echo "3b) reply carries upstream option 82 instead of ours"
+ins $SIM server s0 "$W/server3b.log" 6 replace &
+SRV=$!
+sleep 0.5
+inc $SIM client c0 discover > "$W/client3b.json"
+wait $SRV
+python3 -I - "$W/client3b.json" <<'PY' || fail=1
+import json, sys
+r = json.load(open(sys.argv[1]))["steps"][0]["reply"]
+ok = r is not None and r["o82"] is None and r["udp_csum_ok"]
+print(("  ok   " if ok else "  FAIL ") + "client gets the OFFER, upstream option 82 stripped")
+sys.exit(0 if ok else 1)
+PY
+sleep 1.5
+expect "$(sed -n 's/^rep_foreign_ours_by_xid //p' "$W/stats")" 1 "counted as rep_foreign_ours_by_xid"
+
 stop_agent
 grep -E "^(req_inserted|rep_ours|rep_foreign_dropped|tx_error) " "$W/stats" | sed 's/^/  stat /'
 

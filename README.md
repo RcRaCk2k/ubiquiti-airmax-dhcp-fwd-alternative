@@ -94,7 +94,9 @@ req-mark if=eth0/2 type=REQUEST xid=0x30336d42 chaddr=1c:ed:6f:00:00:01 src=1c:e
 | bereits Option 82 / `giaddr` / `hops` | unverändert weiterleiten (`existing_option82 = forward`) |
 | fehlerhaft, Fragment, falsche Prüfsumme | unverändert weiterleiten, Zähler `req_malformed` |
 | Antwort mit eigener Option 82 | Option 82 entfernen (Länge bleibt, PAD), an eth0 |
-| Antwort mit fremder Option 82 | verwerfen, außer sie gehört zu einem durchgereichten Request |
+| Antwort mit fremder Option 82 zu einem von uns markierten Request (xid + chaddr) | Upstream hat unsere Option 82 ersetzt: Option 82 entfernen, an eth0 (`rep_foreign_ours_by_xid`) |
+| Antwort mit fremder Option 82, durchgereichter Request | unverändert an eth0 |
+| sonstige Antwort mit fremder Option 82 | verwerfen (andere Station) |
 | Antwort ohne Option 82 | weiterleiten |
 | DHCP vom Uplink an Port 67 | nicht angefasst (das regelt die airOS-FIREWALL) |
 | Worker abgestürzt | Regeln bleiben (fail-closed), Neustart mit Backoff |
