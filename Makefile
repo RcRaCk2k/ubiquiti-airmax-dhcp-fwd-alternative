@@ -5,7 +5,7 @@
 #   make test       unit tests on the host
 #   make toolchain  fetch the pinned Zig toolchain
 
-VERSION    := 0.1.0
+VERSION    := 0.2.0
 ZIG        ?= $(CURDIR)/.toolchain/zig-linux-x86_64-0.13.0/zig
 TARGET     := mips-linux-musl
 MCPU       := mips32r2+soft_float
