@@ -19,7 +19,7 @@ passiver Mitschnitt auf `eth0`, `ath0.1284` und `br1`.
 | Funktionsweise Original | Klassisches **L3-Relay**: Empfang über UDP-Socket :67 mit `SO_BINDTODEVICE br1`, setzt `giaddr` und `hops++`, verlangt IPv4 an jedem Interface. Der `ETH_P_ALL`-Socket dient nur zum Senden |
 | airOS-Regeln (`/etc/sysinit/ebtables.conf`) | `FORWARD --logical-in br1 -p IPv4 --ip-proto udp --ip-dport 67 -j DROP`; FIREWALL-Kette an INPUT **und** FORWARD: `-i eth0 sport 67 dport 68 DROP`, `-i ath0.1284 sport 68 dport 67 DROP`; broute: EAP-Kette, `-i ath0 -p 802_1Q --vlan-id 1284 -j DROP` |
 | Neustart durch airOS | Bei jedem *Apply* im Webinterface: `ebtables -t broute -F/-X`, Module entladen und neu laden, `killall dhcp-fwd`, `kill -HUP 1` |
-| Boot-Hooks | `rc.presysinit`/`rc.postsysinit`/`rc.prestart`/`rc.poststart` werden nur ausgeführt, wenn `/etc/<name>` existiert. Die Standard-Firmware legt diese Dateien **nie** an → **keine Custom-Scripts beim Boot** |
+| Boot-Hooks | `rc.presysinit`/`rc.postsysinit`/`rc.prestart`/`rc.poststart` werden nur ausgeführt, wenn `/etc/<name>` existiert. Die Standard-Firmware legt diese Dateien **nie** an → **keine Custom-Scripts beim Boot**. Die CS-Firmware (getestet: WA.v8.7.15-cs.47952.250103.1017) legt `/etc/poststart` an und führt `/etc/persistent/rc.poststart` aus; `ensure` lief dort vor dem ersten Start von `dhcp-fwd` durch init |
 
 ## Befunde zu den Hypothesen
 

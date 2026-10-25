@@ -142,7 +142,12 @@ the configuration is kept), finally `install --save`.
 
 `install` adds a call of `dhcp-snooping-82.sh ensure` to
 `/etc/persistent/rc.poststart` (the line is tagged `# dhcp-snooping-82`; `uninstall`
-removes it). Only **CS firmware** runs this boot hook. The standard firmware
+removes it). Only **CS firmware** runs this boot hook; tested with
+WA.v8.7.15-cs: after a firmware upgrade and reboot, `/etc/persistent` was
+kept and `ensure` mounted the agent before init first started `dhcp-fwd`, so
+the original never ran. DHCP requests the customer sends before the
+wireless link is up stay unanswered, as they would without the agent. The
+standard firmware
 runs **no** custom scripts at boot (`rc.poststart` only if `/etc/poststart`
 exists, which only CS firmware creates). There the original runs after a
 reboot until `dhcp-snooping-82.sh ensure` is called, e.g. by a device discovery over
