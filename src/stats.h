@@ -31,6 +31,23 @@
 	X(rep_malformed)						\
 	X(rep_wrong_op)							\
 	X(rep_ratelimited)						\
+	X(rx6_client)		/* DHCPv6 frames diverted from client port */ \
+	X(rx6_uplink)							\
+	X(req6_wrapped)		/* Relay-Forward built (LDRA) */	\
+	X(req6_untrusted_relay)	/* Relay-Forward from customer, dropped */ \
+	X(req6_server_msg)	/* DHCPv6 server on customer port, dropped */ \
+	X(req6_unicast_passed)						\
+	X(req6_type_skipped)						\
+	X(req6_too_big)							\
+	X(req6_malformed)	/* passed unchanged */			\
+	X(req6_ratelimited)						\
+	X(rep6_ours)		/* Relay-Reply unwrapped to the client */ \
+	X(rep6_foreign_dropped)						\
+	X(rep6_invalid)							\
+	X(rep6_client_msg_dropped)	/* other customers' messages */	\
+	X(rep6_client_msg_forwarded)					\
+	X(rep6_malformed)						\
+	X(rep6_ratelimited)						\
 	X(tx_uplink)							\
 	X(tx_client)							\
 	X(tx_error)

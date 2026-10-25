@@ -10,7 +10,8 @@
 #
 # The airOS broute rules are emulated with nft "meta broute", which has the
 # same effect on a modern kernel: the frame is not bridged but continues on
-# the port's receive path, where the agent's ETH_P_IP sockets get it.
+# the port's receive path, where the agent's ETH_P_IP/ETH_P_IPV6 sockets
+# get it.
 # Old-kernel (2.6.32) behaviour must still be verified on the device.
 set -eu
 
@@ -83,6 +84,10 @@ table bridge ds82 {
 		iifname { "eth0", "eth1" } ip protocol udp udp sport 67 udp dport 68 meta broute set 1
 		iifname "ath0.1284" ether daddr != $BRMAC ip protocol udp udp sport 67 udp dport 68 meta broute set 1
 		iifname "ath0.1284" ip protocol udp udp dport 67 meta broute set 1
+		iifname { "eth0", "eth1" } ip6 nexthdr udp udp dport 547 meta broute set 1
+		iifname { "eth0", "eth1" } ip6 nexthdr udp udp sport 547 udp dport 546 meta broute set 1
+		iifname { "eth0", "eth1" } icmpv6 type nd-router-advert meta broute set 1
+		iifname "ath0.1284" ip6 nexthdr udp udp dport 547 meta broute set 1
 	}
 }
 EOF
@@ -94,7 +99,7 @@ cat > "$W/ebtables" <<'EOF'
 #!/bin/sh
 case "$*" in
 *"-L BROUTING"*) echo "Bridge chain: BROUTING, entries: 1, policy: ACCEPT"; echo "-j DHCP_SNOOPING_82 " ;;
-*"-L DHCP_SNOOPING_82"*) echo "Bridge chain: DHCP_SNOOPING_82, entries: 6, policy: RETURN"; for i in 1 2 3 4 5 6; do echo "-j DROP "; done ;;
+*"-L DHCP_SNOOPING_82"*) echo "Bridge chain: DHCP_SNOOPING_82, entries: 13, policy: RETURN"; for i in $(seq 13); do echo "-j DROP "; done ;;
 esac
 exit 0
 EOF
@@ -242,8 +247,93 @@ check(not [p for p in other if p["xid"] == cl["xid"]], "OFFER not sent to eth0")
 sys.exit(0 if ok else 1)
 PY
 
+# --- 6: DHCPv6 through the lightweight relay agent ------------------
+echo "6) DHCPv6 SOLICIT/REQUEST/RENEW with prefix delegation via LDRA"
+ins $SIM server6 s0.1284 "$W/server6.log" 12 &
+SRV=$!
+inc2 $SIM sniff6 c1 "$W/client6-other.log" 11 &
+SN=$!
+sleep 0.5
+inc $SIM client6 c0 02:11:22:33:44:55 > "$W/client6.json"
+wait $SRV $SN
+python3 -I - "$W/client6.json" "$W/server6.log" "$W/client6-other.log" <<'PY' || fail=1
+import json, sys
+cl = json.load(open(sys.argv[1]))
+srv = [json.loads(l) for l in open(sys.argv[2])]
+other = [json.loads(l) for l in open(sys.argv[3])]
+ok = True
+def check(cond, msg):
+    global ok
+    print(("  ok   " if cond else "  FAIL ") + msg)
+    ok &= cond
+peer = "fe80000000000000001122fffe334455"
+check(not [p for p in srv if p["type"] != 12], "server never sees an unrelayed client message")
+for st in cl["steps"]:
+    mine = [p for p in srv if p.get("xid") == st["xid"]]
+    check(len(mine) == 1, "%s: exactly one Relay-Forward at the server" % st["name"])
+    if mine:
+        p = mine[0]
+        check(p["ifid"] == "cust-example/br1:eth0", "%s: Interface-ID %s" % (st["name"], p["ifid"]))
+        check(p["rid"] == [41112, "00005e005301"], "%s: Remote-ID %s" % (st["name"], p["rid"]))
+        check(p["link"] == "0" * 32 and p["peer"] == peer, "%s: link-address ::, peer = client" % st["name"])
+        check(p["csum_ok"] and p["sport"] == 547, "%s: checksum, port 547" % st["name"])
+    r = st["reply"]
+    check(r is not None, "%s answered" % st["name"])
+    if r:
+        check(r["sport"] == 547 and r["dport"] == 546 and r["csum_ok"],
+              "%s: plain server message to port 546, checksum ok" % st["name"])
+        check(r["prefix"] == "20010db8010000000000000000000000/56",
+              "%s: delegated prefix %s" % (st["name"], r["prefix"]))
+check(not [p for p in other if p.get("dport") == 546], "replies not sent to eth1")
+sys.exit(0 if ok else 1)
+PY
+
+echo "6b) second client port eth1: own Interface-ID"
+ins $SIM server6 s0.1284 "$W/server6b.log" 11 &
+SRV=$!
+sleep 0.5
+inc2 $SIM client6 c1 02:11:22:33:44:66 > "$W/client6b.json"
+wait $SRV
+python3 -I - "$W/client6b.json" "$W/server6b.log" <<'PY' || fail=1
+import json, sys
+cl = json.load(open(sys.argv[1]))
+srv = [json.loads(l) for l in open(sys.argv[2])]
+ids = {p["ifid"] for p in srv if p["type"] == 12}
+ok = ids == {"cust-example/br1:eth1"} and all(s["reply"] for s in cl["steps"])
+print(("  ok   " if ok else "  FAIL ") + "Interface-ID %s, all answered" % sorted(ids))
+sys.exit(0 if ok else 1)
+PY
+
+echo "7) RA guard and DHCPv6 snooping"
+ins $SIM sniff6 s0.1284 "$W/server7.log" 4 &
+SN1=$!
+inc2 $SIM sniff6 c1 "$W/client7-other.log" 4 &
+SN2=$!
+sleep 0.5
+inc $SIM send6 c0 ra
+inc $SIM send6 c0 rogue-advertise
+inc $SIM send6 c0 relay-forward
+wait $SN1 $SN2
+expect "$(count '"kind": "ra"' "$W/server7.log")" 0 "customer RA does not reach the uplink"
+expect "$(count '"kind": "ra"' "$W/client7-other.log")" 0 "customer RA does not reach the other port"
+expect "$(count '"type": 2' "$W/server7.log")" 0 "rogue ADVERTISE blocked"
+expect "$(count 'spoofed' "$W/server7.log")" 0 "spoofed Relay-Forward from the customer blocked"
+expect "$(count '"type": 12' "$W/server7.log")" 0 "and nothing relayed in its place"
+inc $SIM sniff6 c0 "$W/client7.log" 3 &
+SN=$!
+sleep 0.5
+ins $SIM send6 s0.1284 uplink-ra
+ins $SIM send6 s0.1284 foreign-solicit
+wait $SN
+expect "$(count '"kind": "ra"' "$W/client7.log")" 1 "RA from the uplink reaches the customer"
+expect "$(count '"xid": "f0f0f0"' "$W/client7.log")" 0 "other customers' SOLICIT blocked"
+sleep 1.5
+expect "$(sed -n 's/^req6_untrusted_relay //p' "$W/stats")" 1 "counted as req6_untrusted_relay"
+expect "$(sed -n 's/^req6_server_msg //p' "$W/stats")" 1 "counted as req6_server_msg"
+expect "$(sed -n 's/^rep6_client_msg_dropped //p' "$W/stats")" 1 "counted as rep6_client_msg_dropped"
+
 stop_agent
-grep -E "^(port|req_inserted|rep_ours|rep_foreign_dropped|tx_error) " "$W/stats" | sed 's/^/  stat /'
+grep -E "^(port|req_inserted|rep_ours|rep_foreign_dropped|req6_wrapped|rep6_ours|tx_error) " "$W/stats" | sed 's/^/  stat /'
 
 # --- 4: rules present but agent dead: fail closed -------------------
 echo "4) agent stopped, rules kept: DHCP blocked (fail closed)"
@@ -253,6 +343,16 @@ sleep 0.5
 inc $SIM client c0 discover > /dev/null
 wait $SN
 expect "$(grep -c '"op": 1' "$W/server4.log" || true)" 0 "nothing leaks without option 82"
+ins $SIM sniff6 s0.1284 "$W/server4v6.log" 3 &
+SN=$!
+sleep 0.5
+inc $SIM client6 c0 02:11:22:33:44:55 > /dev/null &
+CL=$!
+inc $SIM send6 c0 ra
+wait $SN
+kill $CL 2>/dev/null; wait $CL 2>/dev/null || true
+expect "$(count '"kind": "dhcp6"' "$W/server4v6.log")" 0 "no DHCPv6 leaks unrelayed"
+expect "$(count '"kind": "ra"' "$W/server4v6.log")" 0 "RA guard holds without the agent"
 
 # --- 5: agent running, rules missing: no duplicates -----------------
 echo "5) agent running, no broute rules: bridge forwards exactly once"
@@ -264,7 +364,13 @@ SN=$!
 sleep 0.5
 inc $SIM client c0 discover > /dev/null
 wait $SN
+ins $SIM sniff6 s0.1284 "$W/server5v6.log" 3 &
+SN=$!
+sleep 0.5
+inc $SIM send6 c0 foreign-solicit
+wait $SN
 stop_agent
+expect "$(count '"kind": "dhcp6"' "$W/server5v6.log")" 1 "exactly one SOLICIT on uplink, unrelayed"
 expect "$(grep -c '"op": 1' "$W/server5.log" || true)" 1 "exactly one DISCOVER on uplink"
 expect "$(grep '"op": 1' "$W/server5.log" | grep -c '"o82": null' || true)" 1 "and it is the unmodified original"
 

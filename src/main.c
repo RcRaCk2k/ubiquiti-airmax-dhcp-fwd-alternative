@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: MIT
  * Copyright (c) 2026 The dhcp-snooping-82 authors
  *
- * dhcp-snooping-82: transparent L2 DHCPv4 option 82 agent for airOS bridges.
+ * dhcp-snooping-82: transparent L2 DHCPv4 option 82 agent and DHCPv6
+ * lightweight relay agent (RFC 6221) for airOS bridges.
  *
  * Process model
  *   watcher (root): installs the broute rules, supervises the worker,
@@ -14,7 +15,8 @@
  * ETH_P_ALL taps before the bridge hook, but to protocol (ETH_P_IP) handlers
  * only if the bridge hook returned the frame, i.e. a broute DROP. A socket
  * bound to ETH_P_IP on a bridge port therefore never sees frames the bridge
- * forwarded itself, so a missing rule cannot cause duplicates.
+ * forwarded itself, so a missing rule cannot cause duplicates. The same
+ * holds for the ETH_P_IPV6 sockets used for DHCPv6.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -37,6 +39,7 @@
 
 #include "config.h"
 #include "dhcp.h"
+#include "dhcp6.h"
 #include "ebt.h"
 #include "log.h"
 #include "stats.h"
@@ -174,22 +177,44 @@ static struct sock_filter bpf_reply[] = {
 	{ 0x06, 0, 0, 0 },
 };
 
-static struct sock_filter bpf_any_dhcp[] = {
-	{ 0x28, 0, 0, 12 },
-	{ 0x15, 0, 12, ETH_P_IP_ },
-	{ 0x30, 0, 0, 23 },
-	{ 0x15, 0, 10, 17 },
-	{ 0x28, 0, 0, 20 },
-	{ 0x45, 8, 0, 0x1fff },
-	{ 0xb1, 0, 0, 14 },
-	{ 0x48, 0, 0, 14 },
-	{ 0x15, 4, 0, 67 },
-	{ 0x15, 3, 0, 68 },
-	{ 0x48, 0, 0, 16 },
-	{ 0x15, 1, 0, 67 },
-	{ 0x15, 0, 1, 68 },
+/* DHCPv6 to the relay/server port, no extension headers */
+static struct sock_filter bpf_dhcp6[] = {
+	{ 0x28, 0, 0, 12 },		/* ldh [12]            */
+	{ 0x15, 0, 5, ETH_P_IPV6_ },	/* jne IPv6 -> drop    */
+	{ 0x30, 0, 0, 20 },		/* ldb [20] next hdr   */
+	{ 0x15, 0, 3, 17 },		/* jne UDP -> drop     */
+	{ 0x28, 0, 0, 56 },		/* ldh [56] dport      */
+	{ 0x15, 0, 1, DHCP6_SERVER_PORT },
 	{ 0x06, 0, 0, 0xffff },
 	{ 0x06, 0, 0, 0 },
+};
+
+/* diagnosis: DHCPv4 (67/68) or DHCPv6 (546/547), either port */
+static struct sock_filter bpf_any_dhcp[] = {
+	{ 0x28, 0, 0, 12 },		/*  0 ldh [12]          */
+	{ 0x15, 0, 11, ETH_P_IP_ },	/*  1 IPv4? else 13     */
+	{ 0x30, 0, 0, 23 },		/*  2                   */
+	{ 0x15, 0, 19, 17 },		/*  3 UDP? else drop    */
+	{ 0x28, 0, 0, 20 },		/*  4                   */
+	{ 0x45, 17, 0, 0x1fff },	/*  5 fragment -> drop  */
+	{ 0xb1, 0, 0, 14 },		/*  6                   */
+	{ 0x48, 0, 0, 14 },		/*  7 sport             */
+	{ 0x15, 13, 0, 67 },		/*  8                   */
+	{ 0x15, 12, 0, 68 },		/*  9                   */
+	{ 0x48, 0, 0, 16 },		/* 10 dport             */
+	{ 0x15, 10, 0, 67 },		/* 11                   */
+	{ 0x15, 9, 10, 68 },		/* 12                   */
+	{ 0x15, 0, 9, ETH_P_IPV6_ },	/* 13 IPv6? else drop   */
+	{ 0x30, 0, 0, 20 },		/* 14 next header       */
+	{ 0x15, 0, 7, 17 },		/* 15                   */
+	{ 0x28, 0, 0, 54 },		/* 16 sport             */
+	{ 0x15, 4, 0, DHCP6_CLIENT_PORT },	/* 17           */
+	{ 0x15, 3, 0, DHCP6_SERVER_PORT },	/* 18           */
+	{ 0x28, 0, 0, 56 },		/* 19 dport             */
+	{ 0x15, 1, 0, DHCP6_CLIENT_PORT },	/* 20           */
+	{ 0x15, 0, 1, DHCP6_SERVER_PORT },	/* 21           */
+	{ 0x06, 0, 0, 0xffff },		/* 22 accept            */
+	{ 0x06, 0, 0, 0 },		/* 23 drop              */
 };
 
 #define BPF(a) { sizeof(a) / sizeof(a[0]), a }
@@ -244,6 +269,7 @@ struct bucket {
 /* runtime state per bridge port, same index as cfg.port[] */
 struct pstate {
 	int		fd;
+	int		fd6;		/* DHCPv6, -1 if off */
 	int		ifindex;
 	struct bucket	tb;
 	uint32_t	rx;
@@ -437,23 +463,23 @@ static void count_request(enum reason r)
 	}
 }
 
-static ssize_t receive(int port, uint8_t *buf, size_t cap, time_t now,
-		       uint32_t *ratelimited)
+static ssize_t receive(int port, int v6, uint8_t *buf, size_t cap,
+		       time_t now, uint32_t *ratelimited)
 {
 	struct sockaddr_ll sll;
 	socklen_t sl = sizeof(sll);
 	ssize_t n;
 
 	for (;;) {
-		n = recvfrom(ps[port].fd, buf, cap, MSG_TRUNC,
-			     (struct sockaddr *)&sll, &sl);
+		n = recvfrom(v6 ? ps[port].fd6 : ps[port].fd, buf, cap,
+			     MSG_TRUNC, (struct sockaddr *)&sll, &sl);
 		if (n < 0)
 			return -1;
 		ps[port].rx++;
 		if (cfg.port[port].role == ROLE_CLIENT)
-			st.rx_client++;
+			(*(v6 ? &st.rx6_client : &st.rx_client))++;
 		else
-			st.rx_uplink++;
+			(*(v6 ? &st.rx6_uplink : &st.rx_uplink))++;
 		if (sll.sll_pkttype == PACKET_OUTGOING) {
 			st.rx_outgoing_ignored++;
 			continue;
@@ -479,7 +505,7 @@ static int handle_client(int port, time_t now)
 	int i;
 
 	for (i = 0; i < BURST_PER_POLL; i++) {
-		ssize_t n = receive(port, buf, sizeof(buf), now,
+		ssize_t n = receive(port, 0, buf, sizeof(buf), now,
 				    &st.req_ratelimited);
 		size_t len;
 		enum verdict v;
@@ -555,7 +581,7 @@ static int handle_uplink(int port, time_t now)
 	int i;
 
 	for (i = 0; i < BURST_PER_POLL; i++) {
-		ssize_t n = receive(port, buf, sizeof(buf), now,
+		ssize_t n = receive(port, 0, buf, sizeof(buf), now,
 				    &st.rep_ratelimited);
 		size_t len;
 		enum verdict v;
@@ -629,6 +655,146 @@ static int handle_uplink(int port, time_t now)
 	return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* DHCPv6 */
+
+static void log_packet6(const char *ifname, int ifindex, const char *action,
+			const char *to, const struct dhcp6_info *in,
+			const uint8_t *ifid, size_t ifid_len)
+{
+	char sm[18], dm[18], si[40], di[40], pa[40], c[128];
+	int relay = in->msgtype == DHCP6_RELAY_FORW ||
+		    in->msgtype == DHCP6_RELAY_REPL;
+
+	if (!log_enabled(LOG_LVL_INFO))
+		return;
+	log_pkt(LOG_LVL_INFO,
+		"%s if=%s/%d to=%s type=%s%s%s xid=0x%06x src=%s/%s dst=%s/%s "
+		"peer=%s reason=%s ifid=\"%s\"",
+		action, ifname, ifindex, to, dhcp6_type_str(in->msgtype),
+		relay ? "/" : "", relay ? dhcp6_type_str(in->inner_type) : "",
+		relay ? in->inner_xid : in->xid, mac_str(in->src_mac, sm),
+		ip6_str(in->ip_src, si), mac_str(in->dst_mac, dm),
+		ip6_str(in->ip_dst, di),
+		relay ? ip6_str(in->peer_addr, pa) : "-",
+		dhcp6_reason_str(in->reason),
+		id_str(ifid, ifid_len, c, sizeof(c)));
+}
+
+static int handle_client6(int port, time_t now)
+{
+	static uint8_t buf[FRAME_BUF_LEN];
+	const struct port *p = &cfg.port[port];
+	struct dhcp6_info info;
+	char to[128];
+	int i;
+
+	for (i = 0; i < BURST_PER_POLL; i++) {
+		ssize_t n = receive(port, 1, buf, sizeof(buf), now,
+				    &st.req6_ratelimited);
+		size_t len;
+		enum verdict v;
+
+		if (n < 0)
+			return 0;
+		len = (size_t)n;
+		v = dhcp6_handle_client(buf, &len, sizeof(buf), &p->o6, &info);
+		switch (info.reason) {
+		case R6_WRAPPED:	st.req6_wrapped++; break;
+		case R6_UNTRUSTED_RELAY: st.req6_untrusted_relay++; break;
+		case R6_SERVER_MSG:	st.req6_server_msg++; break;
+		case R6_UNICAST:	st.req6_unicast_passed++; break;
+		case R6_TYPE_SKIPPED:	st.req6_type_skipped++; break;
+		case R6_TOO_BIG:
+			st.req6_too_big++;
+			LOGW("%s: Relay-Forward would exceed the MTU, dropped",
+			     p->name);
+			break;
+		default:		st.req6_malformed++; break;
+		}
+		to[0] = '\0';
+		if (v != VERDICT_DROP &&
+		    xmit_role(p->bridge, ROLE_UPLINK, -1, buf, len,
+			      &st.tx_uplink, to, sizeof(to)) < 0)
+			return -1;
+		log_packet6(p->name, ps[port].ifindex,
+			    v == VERDICT_DROP ? "req6-drop" :
+			    v == VERDICT_FORWARD_MODIFIED ? "req6-relay" :
+			    "req6-pass", v == VERDICT_DROP ? "-" : to, &info,
+			    p->o6.ifid, v == VERDICT_FORWARD_MODIFIED ?
+			    p->o6.ifid_len : 0);
+	}
+	return 0;
+}
+
+/* client port of this bridge the Relay-Reply's Interface-ID names, or -1 */
+static int reply6_owner(int bridge, const struct dhcp6_info *info)
+{
+	int i;
+
+	for (i = 0; i < cfg.nport; i++)
+		if (cfg.port[i].bridge == bridge &&
+		    cfg.port[i].role == ROLE_CLIENT &&
+		    dhcp6_ifid_matches(info, &cfg.port[i].o6))
+			return i;
+	return -1;
+}
+
+static int handle_uplink6(int port, time_t now)
+{
+	static uint8_t buf[FRAME_BUF_LEN];
+	const struct port *p = &cfg.port[port];
+	struct dhcp6_info info;
+	char to[128];
+	int i;
+
+	for (i = 0; i < BURST_PER_POLL; i++) {
+		ssize_t n = receive(port, 1, buf, sizeof(buf), now,
+				    &st.rep6_ratelimited);
+		size_t len;
+		enum verdict v;
+		int owner;
+
+		if (n < 0)
+			return 0;
+		len = (size_t)n;
+		dhcp6_parse(buf, len, &info);
+		owner = reply6_owner(p->bridge, &info);
+		v = dhcp6_handle_uplink(buf, &len,
+					owner >= 0 ? &cfg.port[owner].o6 : NULL,
+					&info);
+		switch (info.reason) {
+		case R6_REPLY_OURS:	st.rep6_ours++; break;
+		case R6_REPLY_FOREIGN:	st.rep6_foreign_dropped++; break;
+		case R6_REPLY_INVALID:	st.rep6_invalid++; break;
+		case R6_CLIENT_MSG:
+			/* other customers' messages: unchanged to our
+			 * customers only if snooping allows it */
+			if (!cfg.block_uplink_requests) {
+				v = VERDICT_FORWARD;
+				st.rep6_client_msg_forwarded++;
+			} else {
+				st.rep6_client_msg_dropped++;
+			}
+			break;
+		default:		st.rep6_malformed++; break;
+		}
+		to[0] = '\0';
+		if (v != VERDICT_DROP &&
+		    xmit_role(p->bridge, ROLE_CLIENT,
+			      v == VERDICT_FORWARD_MODIFIED ? owner : -1, buf,
+			      len, &st.tx_client, to, sizeof(to)) < 0)
+			return -1;
+		if (v != VERDICT_DROP || log_enabled(LOG_LVL_DEBUG))
+			log_packet6(p->name, ps[port].ifindex,
+				    v == VERDICT_DROP ? "rep6-drop" :
+				    v == VERDICT_FORWARD_MODIFIED ? "rep6-unwrap" :
+				    "rep6-pass", v == VERDICT_DROP ? "-" : to,
+				    &info, info.ifid, info.ifid_len);
+	}
+	return 0;
+}
+
 static void drop_privileges(void)
 {
 	if (!cfg.worker_uid || getuid() != 0)
@@ -643,8 +809,10 @@ static void drop_privileges(void)
 static int worker(unsigned restarts)
 {
 	struct sock_fprog preq = BPF(bpf_request), prep = BPF(bpf_reply);
-	struct pollfd pfd[MAX_PORTS];
-	int i, rc = 0;
+	struct sock_fprog p6 = BPF(bpf_dhcp6);
+	struct pollfd pfd[2 * MAX_PORTS];
+	int pport[2 * MAX_PORTS], pv6[2 * MAX_PORTS];
+	int i, rc = 0, npfd = 0;
 	time_t started = mono(), t_stats = 0, t_if = 0, t_win;
 	uint32_t win_marked = 0, win_answered = 0;
 
@@ -656,10 +824,23 @@ static int worker(unsigned restarts)
 				       &ps[i].ifindex);
 		if (ps[i].fd < 0)
 			return EXIT_RESTART;
+		ps[i].fd6 = -1;
+		if (cfg.dhcp6_snooping) {
+			ps[i].fd6 = open_packet(p->name, ETH_P_IPV6_, &p6,
+						&ps[i].ifindex);
+			if (ps[i].fd6 < 0)
+				return EXIT_RESTART;
+		}
 		ps[i].tb.tokens = cfg.rate_burst;
 		ps[i].tb.last = started;
-		pfd[i].fd = ps[i].fd;
-		pfd[i].events = POLLIN;
+		pfd[npfd] = (struct pollfd){ ps[i].fd, POLLIN, 0 };
+		pport[npfd] = i;
+		pv6[npfd++] = 0;
+		if (ps[i].fd6 >= 0) {
+			pfd[npfd] = (struct pollfd){ ps[i].fd6, POLLIN, 0 };
+			pport[npfd] = i;
+			pv6[npfd++] = 1;
+		}
 		LOGI("worker: %s %s/%d (on %s) circuit_id=\"%.*s\"",
 		     role_str(p->role), p->name, ps[i].ifindex,
 		     cfg.br[p->bridge].name,
@@ -672,7 +853,7 @@ static int worker(unsigned restarts)
 
 	while (!sig_stop) {
 		time_t now;
-		int n = poll(pfd, (nfds_t)cfg.nport, 1000);
+		int n = poll(pfd, (nfds_t)npfd, 1000);
 
 		if (n < 0 && errno != EINTR) {
 			LOGE("poll: %s", strerror(errno));
@@ -680,16 +861,20 @@ static int worker(unsigned restarts)
 			break;
 		}
 		now = mono();
-		for (i = 0; n > 0 && i < cfg.nport; i++) {
-			int r = 0;
+		for (i = 0; n > 0 && i < npfd; i++) {
+			int r = 0, pi = pport[i];
+			int client = cfg.port[pi].role == ROLE_CLIENT;
 
 			if (pfd[i].revents & (POLLERR | POLLNVAL)) {
-				LOGW("socket error on %s", cfg.port[i].name);
+				LOGW("socket error on %s", cfg.port[pi].name);
 				r = -1;
 			} else if (pfd[i].revents & POLLIN) {
-				r = cfg.port[i].role == ROLE_CLIENT ?
-					handle_client(i, now) :
-					handle_uplink(i, now);
+				if (pv6[i])
+					r = client ? handle_client6(pi, now) :
+						     handle_uplink6(pi, now);
+				else
+					r = client ? handle_client(pi, now) :
+						     handle_uplink(pi, now);
 			}
 			if (r < 0) {
 				rc = EXIT_RESTART;
@@ -912,8 +1097,8 @@ static const char *pkttype_str(int t)
 static int diag(unsigned seconds)
 {
 	struct sock_fprog prog = BPF(bpf_any_dhcp);
-	struct diag_sock ds[2 * MAX_PORTS + MAX_BRIDGES];
-	struct pollfd pfd[2 * MAX_PORTS + MAX_BRIDGES];
+	struct diag_sock ds[3 * MAX_PORTS + MAX_BRIDGES];
+	struct pollfd pfd[3 * MAX_PORTS + MAX_BRIDGES];
 	static uint8_t buf[FRAME_BUF_LEN];
 	time_t end = seconds ? mono() + seconds : 0;
 	int i, N = 0;
@@ -924,6 +1109,8 @@ static int diag(unsigned seconds)
 					      "ALL", -1, 0 };
 		ds[N++] = (struct diag_sock){ cfg.port[i].name, ETH_P_IP_,
 					      "IP", -1, 0 };
+		ds[N++] = (struct diag_sock){ cfg.port[i].name, ETH_P_IPV6_,
+					      "IP6", -1, 0 };
 	}
 	for (i = 0; i < cfg.nbr; i++)
 		ds[N++] = (struct diag_sock){ cfg.br[i].name, ETH_P_ALL_,
@@ -939,7 +1126,7 @@ static int diag(unsigned seconds)
 		printf("# socket %d: %s %s ifindex=%d\n", i, ds[i].label,
 		       ds[i].ifname, ds[i].ifindex);
 	}
-	printf("# passive diagnosis, nothing is sent; IP sockets only see "
+	printf("# passive diagnosis, nothing is sent; IP/IP6 sockets only see "
 	       "frames diverted by broute\n");
 	fflush(stdout);
 
@@ -963,8 +1150,32 @@ static int diag(unsigned seconds)
 				continue;
 			if ((size_t)n > sizeof(buf))
 				n = sizeof(buf);
-			dhcp_parse(buf, (size_t)n, &in);
 			clock_gettime(CLOCK_REALTIME, &ts);
+			if (n >= 14 && (buf[12] << 8 | buf[13]) == ETH_P_IPV6_) {
+				struct dhcp6_info i6;
+				char a6[40], b6[40], p6[40];
+
+				dhcp6_parse(buf, (size_t)n, &i6);
+				printf("%ld.%03ld %s@%s(%d) pkt=%s len=%d %s>%s "
+				       "%s>%s udp=%u>%u type=%s/%s xid=0x%06x "
+				       "peer=%s ifid=\"%s\" parse=%s\n",
+				       (long)ts.tv_sec, ts.tv_nsec / 1000000L,
+				       ds[i].label, ds[i].ifname, sll.sll_ifindex,
+				       pkttype_str(sll.sll_pkttype), (int)n,
+				       mac_str(i6.src_mac, sm),
+				       mac_str(i6.dst_mac, dm),
+				       ip6_str(i6.ip_src, a6),
+				       ip6_str(i6.ip_dst, b6), i6.sport, i6.dport,
+				       dhcp6_type_str(i6.msgtype),
+				       dhcp6_type_str(i6.inner_type),
+				       i6.inner_type ? i6.inner_xid : i6.xid,
+				       ip6_str(i6.peer_addr, p6),
+				       id_str(i6.ifid, i6.ifid_len, c, sizeof(c)),
+				       dhcp6_reason_str(i6.reason));
+				fflush(stdout);
+				continue;
+			}
+			dhcp_parse(buf, (size_t)n, &in);
 			printf("%ld.%03ld %s@%s(%d) pkt=%s len=%d %s>%s "
 			       "%s>%s op=%u type=%s xid=0x%08x chaddr=%s "
 			       "giaddr=%s hops=%u flags=0x%04x o82=%d "
@@ -1014,8 +1225,9 @@ static void usage(void)
 	       "  -r, --remote-id TEMPLATE    default %%m, \"none\" to omit\n"
 	       "              %%h hostname, %%b bridge, %%p port, %%m bridge MAC,\n"
 	       "              %%M port MAC, %%%% percent sign\n"
-	       "  -o, --option SECTION.KEY=VALUE\n"
-	       "              any key of the configuration file\n",
+	       "  -o, --option SECTION.KEY=VALUE, or just SECTION.KEY=VALUE\n"
+	       "              any key of the configuration file, e.g.\n"
+	       "              dhcpv6.snooping=yes dhcpv6.RAguard=yes\n",
 	       VERSION, DEFAULT_CONFIG);
 }
 
@@ -1040,10 +1252,17 @@ static void print_config(void)
 
 		printf("port            %s/%s %s (lower %s)", cfg.br[p->bridge].name,
 		       p->name, role_str(p->role), p->lower);
-		if (p->role == ROLE_CLIENT)
+		if (p->role == ROLE_CLIENT) {
 			printf(" circuit_id=\"%s\" remote_id=\"%s\"",
 			       id_str(p->o82.cid, p->o82.cid_len, c, sizeof(c)),
 			       id_str(p->o82.rid, p->o82.rid_len, r, sizeof(r)));
+			if (cfg.dhcp6_snooping)
+				printf(" interface_id6=\"%s\" remote_id6=\"%s\"",
+				       id_str(p->o6.ifid, p->o6.ifid_len, c,
+					      sizeof(c)),
+				       id_str(p->o6.rid, p->o6.rid_len, r,
+					      sizeof(r)));
+		}
 		printf("\n");
 	}
 	printf("type_mask       0x%x\n", cfg.type_mask);
@@ -1054,6 +1273,11 @@ static void print_config(void)
 	printf("snooping        client_servers=%s uplink_requests=%s\n",
 	       cfg.block_client_servers ? "blocked" : "allowed",
 	       cfg.block_uplink_requests ? "blocked" : "allowed");
+	printf("dhcpv6          snooping=%s ra_guard=%s unicast=%s "
+	       "enterprise=%u\n", cfg.dhcp6_snooping ? "yes" : "no",
+	       cfg.ra_guard ? "yes" : "no",
+	       cfg.dhcp6_relay_unicast ? "relay" : "forward",
+	       cfg.dhcp6_enterprise);
 	printf("rate_limit      %u/s burst %u per port\n", cfg.rate_pps,
 	       cfg.rate_burst);
 	printf("auto_rollback   %d (window %us, min %u)\n", cfg.auto_rollback,
@@ -1171,6 +1395,11 @@ int main(int argc, char **argv)
 		} else if ((!strcmp(a, "-o") || !strcmp(a, "--option")) &&
 			   i + 1 < argc) {
 			if (add_cli_opt(NULL, argv[++i]) < 0)
+				return 2;
+		} else if (a[0] != '-' && strchr(a, '=') &&
+			   strchr(a, '.') < strchr(a, '=')) {
+			/* bare SECTION.KEY=VALUE, e.g. dhcpv6.RAguard=yes */
+			if (add_cli_opt(NULL, a) < 0)
 				return 2;
 		} else if (!strcmp(a, "-v") || !strcmp(a, "--version")) {
 			printf("dhcp-snooping-82 %s\n", VERSION);

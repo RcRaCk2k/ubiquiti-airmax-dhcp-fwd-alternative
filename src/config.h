@@ -7,6 +7,7 @@
 #include <net/if.h>
 
 #include "dhcp.h"
+#include "dhcp6.h"
 
 #define DEFAULT_CONFIG		"/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.conf"
 #define DEFAULT_SYSTEM_CFG	"/tmp/system.cfg"
@@ -40,6 +41,7 @@ struct port {
 	int		role;
 	int		bridge;			/* index into config.br */
 	struct o82_cfg	o82;			/* client ports: what we insert */
+	struct ldra_cfg	o6;			/* client ports: DHCPv6 relay ids */
 };
 
 struct config {
@@ -67,6 +69,14 @@ struct config {
 	int		nbr;
 	struct port	port[MAX_PORTS];
 	int		nport;
+
+	/* DHCPv6: LDRA (RFC 6221) and RA guard on client ports */
+	int		dhcp6_snooping;
+	int		ra_guard;
+	char		dhcp6_ifid[256];	/* template, "" = circuit_id */
+	char		dhcp6_rid[256];		/* template, "" = remote_id */
+	unsigned	dhcp6_enterprise;	/* of the Remote-ID option */
+	int		dhcp6_relay_unicast;
 
 	int		existing_o82;		/* POL_FORWARD | POL_DROP */
 	int		reply_foreign;		/* POL_DROP default */

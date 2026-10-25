@@ -155,6 +155,20 @@ ARGS="-u br1:eth0 -t br1:eth0"
 check "port with two roles" 'invalid value for interface.trusted: br1:eth0'
 ARGS="-u br1:eth0 -t br1:ath0.1284 -o snooping.block_client_servers=false -o logging.level=debug"
 check "-o sets any key" 'snooping        client_servers=allowed uplink_requests=blocked'
+ARGS="-u br1:eth0 -t br1:ath0.1284"
+check "dhcpv6 defaults" \
+	'dhcpv6          snooping=yes ra_guard=yes unicast=relay enterprise=41112' \
+	'interface_id6="cust-example/br1:eth0" remote_id6="00005e005321"'
+ARGS="-u br1:eth0 -t br1:ath0.1284 dhcpv6.snooping=no dhcpv6.RAguard=no"
+check "bare dhcpv6.snooping=no dhcpv6.RAguard=no" \
+	'dhcpv6          snooping=no ra_guard=no'
+refute "no DHCPv6 ids without snooping" 'interface_id6'
+ARGS="-u br1:eth0 -t br1:ath0.1284 -o dhcpv6.ra_guard=off -o dhcpv6.interface_id=%p -o dhcpv6.remote_id=none -o dhcpv6.enterprise=4491 -o dhcpv6.unicast=forward"
+check "dhcpv6 keys via -o" \
+	'dhcpv6          snooping=yes ra_guard=no unicast=forward enterprise=4491' \
+	'interface_id6="eth0" remote_id6=""'
+ARGS="dhcpv6.snooping=maybe"
+check "dhcpv6 bad value" 'invalid value for dhcpv6.snooping: maybe'
 ARGS="-o nosuch.key=1"
 check "-o unknown key" 'unknown option nosuch.key'
 ARGS="-o foo"

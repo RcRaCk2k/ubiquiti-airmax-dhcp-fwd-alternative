@@ -107,8 +107,16 @@ static int run(const struct config *c, char *const argv[], char *out,
 
 static int jump_count(const struct config *c);
 
+struct rule {
+	int		v6;
+	const char	*notdst;	/* "-d ! MAC" */
+	const char	*sport;
+	const char	*dport;
+	const char	*icmp6_type;	/* instead of UDP ports */
+};
+
 static int add_rule(const struct config *c, const char *ifname,
-		    const char *notdst, const char *sport, const char *dport)
+		    const struct rule *r)
 {
 	char *a[24];
 	int n = 0;
@@ -119,50 +127,89 @@ static int add_rule(const struct config *c, const char *ifname,
 	a[n++] = (char *)"-A";
 	a[n++] = (char *)EBT_CHAIN;
 	a[n++] = (char *)"-p";
-	a[n++] = (char *)"IPv4";
+	a[n++] = (char *)(r->v6 ? "IPv6" : "IPv4");
 	a[n++] = (char *)"-i";
 	a[n++] = (char *)ifname;
-	if (notdst) {
+	if (r->notdst) {
 		a[n++] = (char *)"-d";
 		a[n++] = (char *)"!";
-		a[n++] = (char *)notdst;
+		a[n++] = (char *)r->notdst;
 	}
-	a[n++] = (char *)"--ip-proto";
-	a[n++] = (char *)"udp";
-	if (sport) {
-		a[n++] = (char *)"--ip-sport";
-		a[n++] = (char *)sport;
+	a[n++] = (char *)(r->v6 ? "--ip6-proto" : "--ip-proto");
+	if (r->icmp6_type) {
+		a[n++] = (char *)"58";	/* /etc/protocols may lack the name */
+		a[n++] = (char *)"--ip6-icmp-type";
+		a[n++] = (char *)r->icmp6_type;
+	} else {
+		a[n++] = (char *)"udp";
+		if (r->sport) {
+			a[n++] = (char *)(r->v6 ? "--ip6-sport" : "--ip-sport");
+			a[n++] = (char *)r->sport;
+		}
+		a[n++] = (char *)(r->v6 ? "--ip6-dport" : "--ip-dport");
+		a[n++] = (char *)r->dport;
 	}
-	a[n++] = (char *)"--ip-dport";
-	a[n++] = (char *)dport;
 	a[n++] = (char *)"-j";
 	a[n++] = (char *)"DROP";
 	a[n] = NULL;
 	return run(c, a, NULL, 0);
 }
 
-/* rules per port; must match expected_rules() */
-static int add_port_rules(const struct config *c, const struct port *p)
+/* Rules of one port; with out == NULL only counted (for ebt_check).
+ * Diverted frames nobody listens for are discarded by the IP stack of the
+ * port, which has no address (IPv6 is disabled on airOS bridge ports):
+ * that is the snooping drop. */
+static int port_rules(const struct config *c, const struct port *p,
+		      struct rule *out)
 {
-	char mac[18];
+	static char mac[18];
 	const uint8_t *m = c->br[p->bridge].mac;
-	int rc;
+	struct rule r[8];
+	int n = 0, i;
 
-	if (p->role == ROLE_CLIENT) {
-		/* client requests (also unicast renews) to the agent */
-		rc = add_rule(c, p->name, NULL, NULL, "67");
-		/* snooping: DHCP server behind the customer port */
-		if (!rc && c->block_client_servers)
-			rc = add_rule(c, p->name, NULL, "67", "68");
-		return rc;
-	}
+	memset(r, 0, sizeof(r));
 	snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
 		 m[0], m[1], m[2], m[3], m[4], m[5]);
-	/* server replies, except those for the station itself */
-	rc = add_rule(c, p->name, mac, "67", "68");
-	/* snooping: requests of other customers */
-	if (!rc && c->block_uplink_requests)
-		rc = add_rule(c, p->name, NULL, NULL, "67");
+	if (p->role == ROLE_CLIENT) {
+		/* client requests (also unicast renews) to the agent */
+		r[n++] = (struct rule){ 0, NULL, NULL, "67", NULL };
+		/* snooping: DHCP server behind the customer port */
+		if (c->block_client_servers)
+			r[n++] = (struct rule){ 0, NULL, "67", "68", NULL };
+		if (c->dhcp6_snooping) {
+			/* client messages to the LDRA */
+			r[n++] = (struct rule){ 1, NULL, NULL, "547", NULL };
+			if (c->block_client_servers)
+				r[n++] = (struct rule){ 1, NULL, "547", "546", NULL };
+		}
+		/* RA guard: router advertisements from the customer */
+		if (c->ra_guard)
+			r[n++] = (struct rule){ 1, NULL, NULL, NULL,
+						"router-advertisement" };
+	} else {
+		/* server replies, except those for the station itself */
+		r[n++] = (struct rule){ 0, mac, "67", "68", NULL };
+		/* snooping: requests of other customers */
+		if (c->block_uplink_requests)
+			r[n++] = (struct rule){ 0, NULL, NULL, "67", NULL };
+		/* Relay-Replies, and other customers' messages (dropped by
+		 * the agent, RFC 6221 6.2) */
+		if (c->dhcp6_snooping)
+			r[n++] = (struct rule){ 1, NULL, NULL, "547", NULL };
+	}
+	if (out)
+		for (i = 0; i < n; i++)
+			out[i] = r[i];
+	return n;
+}
+
+static int add_port_rules(const struct config *c, const struct port *p)
+{
+	struct rule r[8];
+	int n = port_rules(c, p, r), i, rc = 0;
+
+	for (i = 0; i < n && !rc; i++)
+		rc = add_rule(c, p->name, &r[i]);
 	return rc;
 }
 
@@ -171,8 +218,7 @@ static int expected_rules(const struct config *c)
 	int i, n = 0;
 
 	for (i = 0; i < c->nport; i++)
-		n += 1 + (c->port[i].role == ROLE_CLIENT ?
-			  !!c->block_client_servers : !!c->block_uplink_requests);
+		n += port_rules(c, &c->port[i], NULL);
 	return n;
 }
 
@@ -190,8 +236,6 @@ int ebt_install(const struct config *c)
 	EBT((char *)"-F", (char *)EBT_CHAIN);
 	if (rc != 0)
 		goto fail;
-	/* diverted frames nobody listens for are discarded by the IP stack
-	 * of the port (no address there): that is the snooping drop */
 	for (i = 0; i < c->nport; i++) {
 		rc = add_port_rules(c, &c->port[i]);
 		if (rc != 0)

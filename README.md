@@ -1,10 +1,11 @@
 # dhcp-snooping-82
 
-Transparent DHCPv4 option 82 agent (RFC 3046) for Ubiquiti airOS 8
-(PowerBeam 5AC, WA.v8.7.11). It replaces `/bin/dhcp-fwd` and adds option 82
-exactly once to every DHCP client packet that physically arrives on a customer
-port, including unicast renews. Apart from that the bridge is left unchanged.
-It is not an L3 relay: `giaddr` stays 0, the upstream relay sets it.
+Transparent DHCPv4 option 82 agent (RFC 3046) and DHCPv6 lightweight relay
+agent (RFC 6221) for Ubiquiti airOS 8 (PowerBeam 5AC, WA.v8.7.11). It replaces
+`/bin/dhcp-fwd` and adds option 82 exactly once to every DHCP client packet
+that physically arrives on a customer port, including unicast renews. Apart
+from that the bridge is left unchanged. It is not an L3 relay: `giaddr` stays
+0, the upstream relay sets it.
 
 * **Bridges:** all bridges with the DHCP relay enabled in `/tmp/system.cfg`
   (`dhcprelay.client.N.devname`), or the ports given with `-u`/`-t`.
@@ -17,6 +18,12 @@ It is not an L3 relay: `giaddr` stays 0, the upstream relay sets it.
 * **DHCP snooping:** DHCP servers on a customer port and requests of other
   customers arriving from the uplink are dropped. The airOS FIREWALL rules for
   this are not needed.
+* **DHCPv6 with prefix delegation:** client messages from a customer port are
+  wrapped into a Relay-Forward with Interface-ID (same text as the circuit ID)
+  and Remote-ID (enterprise number + remote ID); the Relay-Reply is unwrapped
+  and sent only to the port it belongs to. IA_PD passes unchanged, so prefix
+  delegation works through the upstream relay. The same snooping applies.
+* **RA guard:** router advertisements from customer ports are dropped.
 
 Analysis and architecture: [docs/ANALYSIS.md](docs/ANALYSIS.md) (German).
 License: MIT ([LICENSE](LICENSE)).
@@ -56,12 +63,28 @@ dhcp-fwd -n -u br1:eth0,br1:eth1 -t br1:ath0 -u br2:eth0.100 -t br2:ath0.200 \
 | `-i`, `--circuit-id TEMPLATE` | circuit ID (sub-option 1), default `%h/%b:%p` |
 | `-r`, `--remote-id TEMPLATE` | remote ID (sub-option 2), default `%m`, `none` omits it |
 | `-o`, `--option SECTION.KEY=VALUE` | any key of the configuration file, e.g. `-o snooping.block_client_servers=false` |
+| `SECTION.KEY=VALUE` | the same without `-o`, e.g. `dhcpv6.snooping=yes dhcpv6.RAguard=yes` |
 | `-C FILE` | own configuration file (default `/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.conf`) |
 | `-n` / `-d` | foreground / foreground with debug log on stderr |
 | `--check`, `--status`, `--diag [s]` | print the resolved configuration / counters and rule state / passive packet path diagnosis |
 
 Templates: `%h` hostname (`resolv.host.1.name`), `%b` bridge, `%p` port,
 `%m` bridge MAC, `%M` port MAC (MACs as 12 hex digits), `%%` percent sign.
+
+IPv6 options (all default on):
+
+| Option | Meaning |
+|---|---|
+| `dhcpv6.snooping=yes\|no` | DHCPv6 lightweight relay agent and DHCPv6 snooping |
+| `dhcpv6.RAguard=yes\|no` | drop router advertisements arriving on untrusted ports |
+| `dhcpv6.interface_id=TEMPLATE` | Interface-ID (option 18), default: the circuit ID |
+| `dhcpv6.remote_id=TEMPLATE` | Remote-ID (option 37), default: the remote ID, `none` omits it |
+| `dhcpv6.enterprise=N` | enterprise number of the Remote-ID, default 41112 |
+| `dhcpv6.unicast=relay\|forward` | relay unicast client messages too, or pass them unchanged |
+
+The upstream relay or DHCPv6 server has to accept Relay-Forward messages from
+a lightweight relay agent (link-address `::`) and echo the Interface-ID in its
+Relay-Reply, as RFC 6221 requires.
 
 Rules for explicit ports:
 
@@ -133,7 +156,8 @@ kill -HUP $(cat /var/run/dhcp-fwd.pid)       # reload the configuration
 # packet path
 tcpdump -i eth0      -e -n -vvv -s0 'udp port 67 or udp port 68'
 tcpdump -i ath0.1284 -e -n -vvv -s0 'udp port 67 or udp port 68'
-dhcp-fwd --diag 60                           # per socket: ALL = everything, IP = diverted only
+tcpdump -i eth0      -e -n -vvv -s0 'udp port 546 or udp port 547 or icmp6'
+dhcp-fwd --diag 60                           # per socket: ALL = everything, IP/IP6 = diverted only
 
 # rules
 ebtables -t broute -L --Lc                   # jump to DHCP_SNOOPING_82 at position 1
@@ -167,6 +191,13 @@ req-mark if=eth0/2 to=ath0.1284 type=REQUEST xid=0x30336d42 chaddr=1c:ed:6f:00:0
 | DHCP request from the uplink (customers of other stations) | dropped (snooping, `block_uplink_requests`) |
 | DHCP server reply from a customer port (server at the customer) | dropped (snooping, `block_client_servers`) |
 | BOOTREPLY to port 67 from a customer port / BOOTREQUEST to port 68 from the uplink | dropped |
+| DHCPv6 client message from a customer port | wrapped into a Relay-Forward (link-address `::`, peer-address = client, Interface-ID, Remote-ID), MAC and IP addresses kept, sent once to the uplink |
+| Relay-Reply with our Interface-ID | unwrapped, sent as a plain server message to port 546, only to the port the Interface-ID names |
+| Relay-Reply for another relay (other Interface-ID, or a link-address) | dropped |
+| Relay-Forward or DHCPv6 server message from a customer port | dropped (RFC 6221: customer ports are untrusted) |
+| DHCPv6 client message from the uplink (other stations' customers) | dropped (`block_uplink_requests`) |
+| Relay-Forward that would exceed the MTU | dropped and logged (RFC 6221) |
+| router advertisement from a customer port | dropped by an ebtables rule (`ra_guard`), also while the agent is not running |
 | worker crashed | rules stay (fail-closed), restart with backoff |
 | airOS removes the rules (Apply) | re-installed within 5 s; until then the airOS behaviour applies, without duplicates |
 | SIGTERM (relay switched off in the UI, deactivate) | remove rules, exit |

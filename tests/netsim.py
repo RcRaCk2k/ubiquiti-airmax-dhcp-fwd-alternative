@@ -6,6 +6,10 @@
 #   netsim.py server IFACE LOG SECONDS    answer requests, echo option 82
 #   netsim.py client IFACE SCENARIO       run a client scenario, print JSON
 #   netsim.py send IFACE KIND             send one crafted frame
+#   netsim.py server6 IFACE LOG SECONDS   upstream relay/server for LDRA
+#   netsim.py client6 IFACE MAC           Solicit/Request/Renew with IA_PD
+#   netsim.py send6 IFACE KIND            ra, rogue-advertise, ...
+#   netsim.py sniff6 IFACE LOG SECONDS    log DHCPv6 and RA frames
 import json
 import random
 import socket
@@ -225,6 +229,210 @@ def sniff(iface, log, seconds):
                 out.flush()
 
 
+# ------------------------------------------------------------------
+# DHCPv6 / IPv6
+
+ALL_RELAYS = bytes.fromhex("ff020000000000000000000000010002")
+ALL_NODES = bytes.fromhex("ff020000000000000000000000000001")
+MCAST_RELAYS_MAC = bytes.fromhex("333300010002")
+MCAST_NODES_MAC = bytes.fromhex("333300000001")
+PD_PREFIX = bytes.fromhex("20010db8010000000000000000000000")
+
+
+def link_local(mac):
+    eui = bytes([mac[0] ^ 2]) + mac[1:3] + b"\xff\xfe" + mac[3:6]
+    return bytes.fromhex("fe80000000000000") + eui
+
+
+def frame6(dst_mac, src_mac, src, dst, nh, payload, hop=255):
+    hdr = struct.pack("!IHBB", 0x60000000, len(payload), nh, hop) + src + dst
+    return dst_mac + src_mac + b"\x86\xdd" + hdr + payload
+
+
+def l4csum6(src, dst, nh, data):
+    pseudo = src + dst + struct.pack("!IxxxB", len(data), nh)
+    return csum(pseudo + data)
+
+
+def udp6(dst_mac, src_mac, src, dst, sport, dport, msg):
+    u = struct.pack("!HHHH", sport, dport, 8 + len(msg), 0) + msg
+    c = l4csum6(src, dst, 17, u) or 0xFFFF
+    u = u[:6] + struct.pack("!H", c) + u[8:]
+    return frame6(dst_mac, src_mac, src, dst, 17, u, hop=1)
+
+
+def opt(code, data):
+    return struct.pack("!HH", code, len(data)) + data
+
+
+def opts6(data):
+    r, i = {}, 0
+    while i + 4 <= len(data):
+        code, ln = struct.unpack("!HH", data[i:i + 4])
+        r.setdefault(code, data[i + 4:i + 4 + ln])
+        i += 4 + ln
+    return r
+
+
+def parse6(f):
+    """dict for DHCPv6 and RA frames, else None"""
+    if len(f) < 62 or f[12:14] != b"\x86\xdd":
+        return None
+    nh, src, dst = f[20], f[22:38], f[38:54]
+    pl = f[54:54 + struct.unpack("!H", f[18:20])[0]]
+    r = {"dst": f[0:6].hex(), "src": f[6:12].hex(), "ip_src": src.hex(),
+         "ip_dst": dst.hex()}
+    if nh == 58 and pl and pl[0] == 134:
+        r["kind"] = "ra"
+        return r
+    if nh != 17:
+        return None
+    sport, dport, ulen, ucs = struct.unpack("!HHHH", pl[:8])
+    if not ({sport, dport} & {546, 547}):
+        return None
+    m = pl[8:ulen]
+    r.update({"kind": "dhcp6", "sport": sport, "dport": dport,
+              "type": m[0], "csum_ok": l4csum6(src, dst, 17, pl[:ulen]) == 0})
+    if m[0] in (12, 13):
+        o = opts6(m[34:])
+        r["link"] = m[2:18].hex()
+        r["peer"] = m[18:34].hex()
+        r["ifid"] = o.get(18, b"").decode("latin1")
+        rid = o.get(37)
+        r["rid"] = None if rid is None else [
+            struct.unpack("!I", rid[:4])[0], rid[4:].decode("latin1")]
+        inner = o.get(9, b"")
+        r["inner_type"] = inner[0] if inner else None
+        r["xid"] = inner[1:4].hex() if len(inner) >= 4 else None
+        r["inner"] = inner.hex()
+    else:
+        r["xid"] = m[1:4].hex()
+        o = opts6(m[4:])
+        pd = o.get(25)
+        r["ia_pd"] = pd is not None
+        r["prefix"] = None
+        if pd and 26 in opts6(pd[12:]):
+            pfx = opts6(pd[12:])[26]
+            r["prefix"] = "%s/%d" % (pfx[9:25].hex(), pfx[8])
+    return r
+
+
+def recv6(s, until, want=lambda p: True):
+    while time.time() < until:
+        try:
+            f, addr = s.recvfrom(4096)
+        except socket.timeout:
+            continue
+        if addr[2] == PACKET_OUTGOING:
+            continue
+        p = parse6(f)
+        if p and want(p):
+            return p, f
+    return None, None
+
+
+def client_msg6(mtype, xid, mac, ia_pd=True):
+    duid = opt(1, struct.pack("!HH", 3, 1) + mac)
+    m = bytes([mtype]) + xid + duid + opt(8, b"\0\0")
+    if ia_pd:
+        m += opt(25, struct.pack("!III", 1, 0, 0))
+    return m
+
+
+def server6(iface, log, seconds):
+    """answers Relay-Forwards like an upstream relay + server would"""
+    s = open_sock(iface)
+    me = link_local(SERVER_MAC)
+    end = time.time() + float(seconds)
+    with open(log, "w") as out:
+        while time.time() < end:
+            p, f = recv6(s, min(end, time.time() + 0.5),
+                         lambda p: p["kind"] == "dhcp6" and p["dport"] == 547)
+            if not p:
+                continue
+            out.write(json.dumps(p) + "\n")
+            out.flush()
+            if p["type"] != 12:
+                continue	# a plain client message: nothing relayed
+            inner = bytes.fromhex(p["inner"])
+            rtype = {1: 2, 3: 7, 5: 7, 6: 7, 11: 7}.get(inner[0])
+            if not rtype:
+                continue
+            o = opts6(inner[4:])
+            iapd = opt(25, struct.pack("!III", 1, 1800, 2880) + opt(
+                26, struct.pack("!IIB", 3600, 7200, 56) + PD_PREFIX))
+            reply = bytes([rtype]) + inner[1:4] + opt(1, o.get(1, b"")) + \
+                opt(2, struct.pack("!HH", 3, 1) + SERVER_MAC) + iapd
+            m = f[54 + 8:]
+            rel = opts6(m[34:])
+            rr = bytes([13, 0]) + m[2:34] + opt(18, rel[18]) + opt(9, reply)
+            peer = m[18:34]
+            s.send(udp6(f[6:12], SERVER_MAC, me, peer, 547, 547, rr))
+
+
+def client6(iface, mac):
+    macb = bytes.fromhex(mac.replace(":", ""))
+    s = open_sock(iface)
+    me = link_local(macb)
+    res = {"steps": []}
+    for name, mtype in (("solicit", 1), ("request", 3), ("renew", 5)):
+        xid = random.getrandbits(24).to_bytes(3, "big")
+        s.send(udp6(MCAST_RELAYS_MAC, macb, me, ALL_RELAYS, 546, 547,
+                    client_msg6(mtype, xid, macb)))
+        p, _ = recv6(s, time.time() + 3,
+                     lambda p: p["kind"] == "dhcp6" and p["dport"] == 546 and
+                     p["xid"] == xid.hex())
+        res["steps"].append({"name": name, "xid": xid.hex(), "reply": p})
+    print(json.dumps(res))
+
+
+def send6(iface, kind):
+    s = open_sock(iface)
+    other = bytes.fromhex("02deadbeef01")
+    if kind == "ra":
+        # router advertisement from the customer's router
+        src = link_local(CLIENT_MAC)
+        ra = bytes([134, 0, 0, 0, 64, 0]) + struct.pack("!HII", 1800, 0, 0)
+        c = l4csum6(src, ALL_NODES, 58, ra)
+        ra = ra[:2] + struct.pack("!H", c) + ra[4:]
+        f = frame6(MCAST_NODES_MAC, CLIENT_MAC, src, ALL_NODES, 58, ra)
+    elif kind == "uplink-ra":
+        src = link_local(SERVER_MAC)
+        ra = bytes([134, 0, 0, 0, 64, 0]) + struct.pack("!HII", 1800, 0, 0)
+        c = l4csum6(src, ALL_NODES, 58, ra)
+        ra = ra[:2] + struct.pack("!H", c) + ra[4:]
+        f = frame6(MCAST_NODES_MAC, SERVER_MAC, src, ALL_NODES, 58, ra)
+    elif kind == "rogue-advertise":
+        # DHCPv6 server behind the customer port
+        f = udp6(MCAST_RELAYS_MAC, CLIENT_MAC, link_local(CLIENT_MAC),
+                 ALL_RELAYS, 547, 547, client_msg6(2, b"\xba\xdf\x00", other))
+    elif kind == "relay-forward":
+        # spoofed Relay-Forward with a made-up Interface-ID
+        inner = client_msg6(1, b"\x5f\x00\x0f", CLIENT_MAC)
+        rf = bytes([12, 0]) + b"\0" * 16 + link_local(CLIENT_MAC) + \
+            opt(18, b"spoofed") + opt(9, inner)
+        f = udp6(MCAST_RELAYS_MAC, CLIENT_MAC, link_local(CLIENT_MAC),
+                 ALL_RELAYS, 547, 547, rf)
+    elif kind == "foreign-solicit":
+        # another station's customer, as seen on the uplink
+        f = udp6(MCAST_RELAYS_MAC, other, link_local(other), ALL_RELAYS,
+                 546, 547, client_msg6(1, b"\xf0\xf0\xf0", other))
+    else:
+        raise SystemExit("unknown kind")
+    s.send(f)
+
+
+def sniff6(iface, log, seconds):
+    s = open_sock(iface)
+    end = time.time() + float(seconds)
+    with open(log, "w") as out:
+        while time.time() < end:
+            p, _ = recv6(s, end)
+            if p:
+                out.write(json.dumps(p) + "\n")
+                out.flush()
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "server":
@@ -235,3 +443,11 @@ if __name__ == "__main__":
         send(*sys.argv[2:4])
     elif cmd == "sniff":
         sniff(*sys.argv[2:5])
+    elif cmd == "server6":
+        server6(*sys.argv[2:5])
+    elif cmd == "client6":
+        client6(*sys.argv[2:4])
+    elif cmd == "send6":
+        send6(*sys.argv[2:4])
+    elif cmd == "sniff6":
+        sniff6(*sys.argv[2:5])

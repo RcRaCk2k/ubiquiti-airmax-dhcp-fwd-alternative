@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
@@ -58,6 +59,10 @@ void config_defaults(struct config *c)
 	c->type_mask = TYPE_BIT(0) | TYPE_BIT(DHCP_DISCOVER) |
 		       TYPE_BIT(DHCP_REQUEST) | TYPE_BIT(DHCP_DECLINE) |
 		       TYPE_BIT(DHCP_RELEASE) | TYPE_BIT(DHCP_INFORM);
+	c->dhcp6_snooping = 1;
+	c->ra_guard = 1;
+	c->dhcp6_enterprise = 41112;	/* Ubiquiti's private enterprise number */
+	c->dhcp6_relay_unicast = 1;
 	c->existing_o82 = POL_FORWARD;
 	c->reply_foreign = POL_DROP;
 	c->reply_no_o82 = POL_FORWARD;
@@ -257,6 +262,29 @@ static int set_key(struct config *c, const char *sec, const char *key,
 		return parse_types(val, &c->type_mask);
 	if (KEY("option82", "existing_option82"))
 		return parse_policy(val, &c->existing_o82);
+	if (!strcasecmp(sec, "dhcpv6")) {
+		/* also as dhcpv6.RAguard=yes on the command line */
+		if (!strcasecmp(key, "snooping"))
+			return parse_bool(val, &c->dhcp6_snooping);
+		if (!strcasecmp(key, "ra_guard") || !strcasecmp(key, "raguard"))
+			return parse_bool(val, &c->ra_guard);
+		if (!strcasecmp(key, "interface_id"))
+			return STR(c->dhcp6_ifid);
+		if (!strcasecmp(key, "remote_id"))
+			return STR(c->dhcp6_rid);
+		if (!strcasecmp(key, "enterprise"))
+			return parse_uint(val, &c->dhcp6_enterprise, 0xffffffffu);
+		if (!strcasecmp(key, "unicast")) {
+			if (!strcmp(val, "relay"))
+				c->dhcp6_relay_unicast = 1;
+			else if (!strcmp(val, "forward"))
+				c->dhcp6_relay_unicast = 0;
+			else
+				return -1;
+			return 0;
+		}
+		return -2;
+	}
 	if (KEY("reply", "foreign_option82"))
 		return parse_policy(val, &c->reply_foreign);
 	if (KEY("reply", "without_option82"))
@@ -905,6 +933,35 @@ static int auto_ports(struct config *c, char *err, size_t errlen)
 	return 0;
 }
 
+/* DHCPv6 Interface-ID / Remote-ID, by default the same as option 82 */
+static int resolve_ldra(const struct config *c, struct port *p, char *err,
+			size_t errlen)
+{
+	const char *ifid = c->dhcp6_ifid[0] ? c->dhcp6_ifid : c->circuit_id;
+	const char *rid = c->dhcp6_rid[0] ? c->dhcp6_rid : c->remote_id;
+	uint8_t buf[251], n;
+
+	p->o6.mtu = c->mtu;
+	p->o6.enterprise = c->dhcp6_enterprise;
+	p->o6.relay_unicast = c->dhcp6_relay_unicast;
+	if (expand(c, ifid, p, p->o6.ifid, &p->o6.ifid_len) < 0 ||
+	    !p->o6.ifid_len) {
+		snprintf(err, errlen, "bad dhcpv6 interface_id for %s", p->name);
+		return -1;
+	}
+	if (!strcmp(rid, "none") || !rid[0]) {
+		p->o6.rid_len = 0;
+		return 0;
+	}
+	if (expand(c, rid, p, buf, &n) < 0 || n > sizeof(p->o6.rid)) {
+		snprintf(err, errlen, "bad dhcpv6 remote_id for %s", p->name);
+		return -1;
+	}
+	memcpy(p->o6.rid, buf, n);
+	p->o6.rid_len = n;
+	return 0;
+}
+
 int config_resolve(struct config *c, char *err, size_t errlen)
 {
 	int k, r;
@@ -944,6 +1001,8 @@ int config_resolve(struct config *c, char *err, size_t errlen)
 			snprintf(err, errlen, "circuit_id + remote_id too long");
 			return -1;
 		}
+		if (resolve_ldra(c, p, err, errlen) < 0)
+			return -1;
 	}
 	return 0;
 }
