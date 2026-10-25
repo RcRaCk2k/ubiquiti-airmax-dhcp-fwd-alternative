@@ -50,6 +50,9 @@ enum reason6 {
 	R6_REPLY_OURS,		/* Relay-Reply with our Interface-ID, unwrapped */
 	R6_REPLY_FOREIGN,	/* Relay-Reply for another relay agent */
 	R6_REPLY_INVALID,	/* Relay-Reply failing the RFC 6221 checks */
+	R6_RA,			/* router advertisement from a client port */
+	R6_ICMP6,		/* other ICMPv6 (ND, MLD, ...), passed on */
+	R6_ICMP6_BAD,		/* fragmented or truncated ICMPv6 */
 	R6_MAX
 };
 
@@ -101,6 +104,16 @@ enum verdict dhcp6_handle_client(uint8_t *frame, size_t *len, size_t cap,
 enum verdict dhcp6_handle_uplink(uint8_t *frame, size_t *len,
 				 const struct ldra_cfg *cfg,
 				 struct dhcp6_info *info);
+
+/* RA guard. The 2.6.32 ebt_ip6 cannot match ICMPv6 types, so the broute
+ * rule diverts all link-local ICMPv6 of a client port (every valid RA has a
+ * link-local source, RFC 4861) and this decides: router advertisements and
+ * fragmented or truncated ICMPv6 (RFC 6980: ND must not be fragmented) are
+ * VERDICT_DROP, everything else is VERDICT_FORWARD unchanged. Hop-by-hop
+ * and destination options headers are skipped, so they cannot hide an RA
+ * (RFC 7113). */
+enum verdict dhcp6_ra_guard(const uint8_t *frame, size_t len,
+			    struct dhcp6_info *info);
 
 /* 1 if the Interface-ID decoded into info is cfg's */
 int dhcp6_ifid_matches(const struct dhcp6_info *info,

@@ -508,7 +508,73 @@ static void test_fuzz(void)
 		dhcp6_handle_client(f, &l, sizeof(f), &cfg, &info);
 		l = len;
 		dhcp6_handle_uplink(f, &l, &cfg, &info);
+		dhcp6_ra_guard(f, len, &info);
+		if (len > 21) {		/* also as ICMPv6 behind ext headers */
+			f[20] = (uint8_t)(rnd() % 2 ? 0 : 58);
+			dhcp6_ra_guard(f, len, &info);
+		}
 	}
+}
+
+/* ICMPv6 frame, optionally behind an extension header (code ext) */
+static size_t icmp6_frame(uint8_t *f, int type, int ext, size_t trunc)
+{
+	uint8_t pl[64];
+	size_t n = 0;
+
+	memset(pl, 0, sizeof(pl));
+	if (ext >= 0) {
+		pl[0] = 58;		/* next header */
+		pl[1] = 0;		/* 8 bytes */
+		if (ext == 0)		/* router alert, as MLD carries it */
+			memcpy(pl + 2, "\x05\x02\x00\x00\x01\x00", 6);
+		n = 8;
+	}
+	pl[n] = (uint8_t)type;
+	n += 16;
+	n = frame(f, MCAST_MAC, CLIENT_MAC, CLIENT_LL, ALL_RELAYS, 0, 0, pl, n);
+	memmove(f + 54, f + OFF_D, n - OFF_D);	/* no UDP header */
+	n -= 8;
+	f[20] = ext >= 0 ? (uint8_t)ext : 58;
+	f[21] = 255;
+	put16(f + 18, (unsigned)(n - 54 - trunc));
+	return n - trunc;
+}
+
+static void expect_ra(int type, int ext, size_t trunc, enum verdict v,
+		      enum reason6 r)
+{
+	uint8_t f[256];
+	struct dhcp6_info info;
+	size_t n = icmp6_frame(f, type, ext, trunc);
+
+	CHECK(dhcp6_ra_guard(f, n, &info) == v);
+	CHECK(info.reason == r);
+}
+
+static void test_ra_guard(void)
+{
+	uint8_t f[256];
+	struct dhcp6_info info;
+	size_t n;
+
+	expect_ra(134, -1, 0, VERDICT_DROP, R6_RA);	/* RA */
+	expect_ra(134, 0, 0, VERDICT_DROP, R6_RA);	/* behind hop-by-hop */
+	expect_ra(134, 60, 0, VERDICT_DROP, R6_RA);	/* behind dest options */
+	expect_ra(134, 44, 0, VERDICT_DROP, R6_ICMP6_BAD); /* fragment */
+	expect_ra(134, 43, 0, VERDICT_DROP, R6_ICMP6_BAD); /* routing header */
+	expect_ra(135, -1, 0, VERDICT_FORWARD, R6_ICMP6);	/* NS */
+	expect_ra(136, -1, 0, VERDICT_FORWARD, R6_ICMP6);	/* NA */
+	expect_ra(133, -1, 0, VERDICT_FORWARD, R6_ICMP6);	/* RS */
+	expect_ra(143, 0, 0, VERDICT_FORWARD, R6_ICMP6);	/* MLDv2 report */
+	expect_ra(128, -1, 0, VERDICT_FORWARD, R6_ICMP6);	/* echo */
+	expect_ra(134, -1, 14, VERDICT_DROP, R6_ICMP6_BAD); /* truncated */
+	expect_ra(134, 0, 18, VERDICT_DROP, R6_ICMP6_BAD); /* in the ext hdr */
+	n = icmp6_frame(f, 134, -1, 0);
+	CHECK(dhcp6_ra_guard(f, n - 4, &info) == VERDICT_DROP);	/* short frame */
+	CHECK(dhcp6_ra_guard(f, 30, &info) == VERDICT_DROP);
+	put16(f + 12, 0x0800);
+	CHECK(dhcp6_ra_guard(f, n, &info) == VERDICT_DROP);
 }
 
 static void test_ip6_str(void)
@@ -535,6 +601,7 @@ int main(void)
 	test_uplink_drops();
 	test_roundtrip();
 	test_ip6_str();
+	test_ra_guard();
 	test_fuzz();
 	fclose(pcap_out);
 	printf("dhcp6: %d checks, %d failures\n", checks, failures);

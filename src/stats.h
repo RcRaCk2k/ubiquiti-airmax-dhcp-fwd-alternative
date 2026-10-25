@@ -48,6 +48,10 @@
 	X(rep6_client_msg_forwarded)					\
 	X(rep6_malformed)						\
 	X(rep6_ratelimited)						\
+	X(ra_dropped)		/* RA guard: RAs from client ports */	\
+	X(icmp6_passed)		/* ND/MLD of client ports, passed on */	\
+	X(icmp6_dropped)	/* fragmented/truncated, dropped */	\
+	X(icmp6_ratelimited)						\
 	X(tx_uplink)							\
 	X(tx_client)							\
 	X(tx_error)

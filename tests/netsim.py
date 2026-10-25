@@ -282,8 +282,11 @@ def parse6(f):
     pl = f[54:54 + struct.unpack("!H", f[18:20])[0]]
     r = {"dst": f[0:6].hex(), "src": f[6:12].hex(), "ip_src": src.hex(),
          "ip_dst": dst.hex()}
-    if nh == 58 and pl and pl[0] == 134:
-        r["kind"] = "ra"
+    if nh == 0 and len(pl) > 8 and pl[0] == 58:    # behind hop-by-hop
+        nh, pl = 58, pl[(pl[1] + 1) * 8:]
+    if nh == 58 and pl:
+        r["kind"] = {134: "ra", 135: "ns", 136: "na"}.get(pl[0], "icmp6")
+        r["hop"] = f[21]
         return r
     if nh != 17:
         return None
@@ -396,6 +399,25 @@ def send6(iface, kind):
         c = l4csum6(src, ALL_NODES, 58, ra)
         ra = ra[:2] + struct.pack("!H", c) + ra[4:]
         f = frame6(MCAST_NODES_MAC, CLIENT_MAC, src, ALL_NODES, 58, ra)
+    elif kind == "ra-hbh":
+        # the same, hidden behind a hop-by-hop header (RFC 7113 evasion)
+        src = link_local(CLIENT_MAC)
+        ra = bytes([134, 0, 0, 0, 64, 0]) + struct.pack("!HII", 1800, 0, 0)
+        c = l4csum6(src, ALL_NODES, 58, ra)
+        ra = ra[:2] + struct.pack("!H", c) + ra[4:]
+        hbh = bytes([58, 0, 1, 4, 0, 0, 0, 0])
+        f = frame6(MCAST_NODES_MAC, CLIENT_MAC, src, ALL_NODES, 0, hbh + ra)
+    elif kind == "ns":
+        # neighbour solicitation for the router, solicited-node multicast
+        src = link_local(CLIENT_MAC)
+        target = link_local(SERVER_MAC)
+        dst = bytes.fromhex("ff0200000000000000000001ff") + target[13:]
+        ns = bytes([135, 0, 0, 0, 0, 0, 0, 0]) + target + \
+            bytes([1, 1]) + CLIENT_MAC
+        c = l4csum6(src, dst, 58, ns)
+        ns = ns[:2] + struct.pack("!H", c) + ns[4:]
+        f = frame6(bytes.fromhex("3333ff") + target[13:], CLIENT_MAC, src,
+                   dst, 58, ns)
     elif kind == "uplink-ra":
         src = link_local(SERVER_MAC)
         ra = bytes([134, 0, 0, 0, 64, 0]) + struct.pack("!HII", 1800, 0, 0)

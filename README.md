@@ -23,7 +23,10 @@ from that the bridge is left unchanged. It is not an L3 relay: `giaddr` stays
   and Remote-ID (enterprise number + remote ID); the Relay-Reply is unwrapped
   and sent only to the port it belongs to. IA_PD passes unchanged, so prefix
   delegation works through the upstream relay. The same snooping applies.
-* **RA guard:** router advertisements from customer ports are dropped.
+* **RA guard:** router advertisements from customer ports are dropped. The
+  ebtables of kernel 2.6.32 cannot match ICMPv6 types, so all link-local
+  ICMPv6 of a customer port (neighbour discovery, MLD, RA) goes through the
+  agent, which drops the RAs and passes everything else on unchanged.
 
 Analysis and architecture: [docs/ANALYSIS.md](docs/ANALYSIS.md) (German).
 License: MIT ([LICENSE](LICENSE)).
@@ -85,6 +88,10 @@ IPv6 options (all default on):
 The upstream relay or DHCPv6 server has to accept Relay-Forward messages from
 a lightweight relay agent (link-address `::`) and echo the Interface-ID in its
 Relay-Reply, as RFC 6221 requires.
+
+With `ra_guard` the station itself no longer receives multicast neighbour
+discovery from the customer side, so it cannot be reached over IPv6 from
+the customer's LAN; from the uplink side nothing changes.
 
 Rules for explicit ports:
 
@@ -197,7 +204,9 @@ req-mark if=eth0/2 to=ath0.1284 type=REQUEST xid=0x30336d42 chaddr=1c:ed:6f:00:0
 | Relay-Forward or DHCPv6 server message from a customer port | dropped (RFC 6221: customer ports are untrusted) |
 | DHCPv6 client message from the uplink (other stations' customers) | dropped (`block_uplink_requests`) |
 | Relay-Forward that would exceed the MTU | dropped and logged (RFC 6221) |
-| router advertisement from a customer port | dropped by an ebtables rule (`ra_guard`), also while the agent is not running |
+| router advertisement from a customer port | dropped (`ra_guard`), also when hidden behind hop-by-hop or destination options headers |
+| other link-local ICMPv6 from a customer port (ND, MLD, echo) | passed on unchanged: multicast to all other ports of the bridge, unicast to the uplink; fragmented ND is dropped (RFC 6980) |
+| worker crashed while `ra_guard` is on | link-local ICMPv6 of the customer is blocked until the worker is back (fail-closed), so IPv6 pauses for that time |
 | worker crashed | rules stay (fail-closed), restart with backoff |
 | airOS removes the rules (Apply) | re-installed within 5 s; until then the airOS behaviour applies, without duplicates |
 | SIGTERM (relay switched off in the UI, deactivate) | remove rules, exit |

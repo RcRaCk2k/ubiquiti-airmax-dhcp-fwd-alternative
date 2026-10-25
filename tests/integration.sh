@@ -86,7 +86,7 @@ table bridge ds82 {
 		iifname "ath0.1284" ip protocol udp udp dport 67 meta broute set 1
 		iifname { "eth0", "eth1" } ip6 nexthdr udp udp dport 547 meta broute set 1
 		iifname { "eth0", "eth1" } ip6 nexthdr udp udp sport 547 udp dport 546 meta broute set 1
-		iifname { "eth0", "eth1" } icmpv6 type nd-router-advert meta broute set 1
+		iifname { "eth0", "eth1" } ether daddr != $BRMAC ip6 saddr fe80::/10 meta l4proto icmpv6 meta broute set 1
 		iifname "ath0.1284" ip6 nexthdr udp udp dport 547 meta broute set 1
 	}
 }
@@ -311,11 +311,16 @@ inc2 $SIM sniff6 c1 "$W/client7-other.log" 4 &
 SN2=$!
 sleep 0.5
 inc $SIM send6 c0 ra
+inc $SIM send6 c0 ra-hbh
+inc $SIM send6 c0 ns
 inc $SIM send6 c0 rogue-advertise
 inc $SIM send6 c0 relay-forward
 wait $SN1 $SN2
 expect "$(count '"kind": "ra"' "$W/server7.log")" 0 "customer RA does not reach the uplink"
 expect "$(count '"kind": "ra"' "$W/client7-other.log")" 0 "customer RA does not reach the other port"
+expect "$(count '"kind": "ns"' "$W/server7.log")" 1 "neighbour solicitation passes to the uplink once"
+expect "$(grep '"kind": "ns"' "$W/server7.log" | grep -c '"hop": 255' || true)" 1 "with hop limit 255 unchanged"
+expect "$(count '"kind": "ns"' "$W/client7-other.log")" 1 "and, being multicast, to the other customer port"
 expect "$(count '"type": 2' "$W/server7.log")" 0 "rogue ADVERTISE blocked"
 expect "$(count 'spoofed' "$W/server7.log")" 0 "spoofed Relay-Forward from the customer blocked"
 expect "$(count '"type": 12' "$W/server7.log")" 0 "and nothing relayed in its place"
@@ -328,6 +333,7 @@ wait $SN
 expect "$(count '"kind": "ra"' "$W/client7.log")" 1 "RA from the uplink reaches the customer"
 expect "$(count '"xid": "f0f0f0"' "$W/client7.log")" 0 "other customers' SOLICIT blocked"
 sleep 1.5
+expect "$(sed -n 's/^ra_dropped //p' "$W/stats")" 2 "counted as ra_dropped (plain and behind hop-by-hop)"
 expect "$(sed -n 's/^req6_untrusted_relay //p' "$W/stats")" 1 "counted as req6_untrusted_relay"
 expect "$(sed -n 's/^req6_server_msg //p' "$W/stats")" 1 "counted as req6_server_msg"
 expect "$(sed -n 's/^rep6_client_msg_dropped //p' "$W/stats")" 1 "counted as rep6_client_msg_dropped"

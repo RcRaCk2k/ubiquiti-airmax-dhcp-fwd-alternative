@@ -312,6 +312,47 @@ enum verdict dhcp6_handle_uplink(uint8_t *frame, size_t *len,
 	return VERDICT_FORWARD_MODIFIED;
 }
 
+enum verdict dhcp6_ra_guard(const uint8_t *frame, size_t len,
+			    struct dhcp6_info *info)
+{
+	size_t o = OFF_UDP, end;
+	uint8_t nh;
+
+	memset(info, 0, sizeof(*info));
+	info->reason = R6_ICMP6_BAD;
+	if (len < OFF_UDP || get16(frame + 12) != ETH_P_IPV6_ ||
+	    frame[OFF_IP6] >> 4 != 6)
+		return VERDICT_DROP;
+	memcpy(info->dst_mac, frame, 6);
+	memcpy(info->src_mac, frame + 6, 6);
+	memcpy(info->ip_src, frame + OFF_IP6 + 8, 16);
+	memcpy(info->ip_dst, frame + OFF_IP6 + 24, 16);
+	end = OFF_UDP + get16(frame + OFF_IP6 + 4);
+	if (end > len)
+		return VERDICT_DROP;
+	nh = frame[OFF_IP6 + 6];
+	while (nh == 0 || nh == 60) {		/* hop-by-hop, destination */
+		if (o + 8 > end)
+			return VERDICT_DROP;
+		nh = frame[o];
+		o += ((size_t)frame[o + 1] + 1) * 8;
+	}
+	if (nh != 58) {
+		/* routing, fragment or anything else in front of ICMPv6: an
+		 * evasion attempt or not ND at all, drop either way */
+		return VERDICT_DROP;
+	}
+	if (o + 4 > end)
+		return VERDICT_DROP;
+	info->msgtype = frame[o];
+	if (info->msgtype == 134) {
+		info->reason = R6_RA;
+		return VERDICT_DROP;
+	}
+	info->reason = R6_ICMP6;
+	return VERDICT_FORWARD;
+}
+
 const char *dhcp6_reason_str(enum reason6 r)
 {
 	static const char *const s[R6_MAX] = {
@@ -319,6 +360,7 @@ const char *dhcp6_reason_str(enum reason6 r)
 		"untrusted-relay", "server-message", "client-message",
 		"type-skipped", "unicast", "too-big", "wrapped",
 		"reply-ours", "reply-foreign", "reply-invalid",
+		"router-advertisement", "icmp6", "icmp6-fragment-or-truncated",
 	};
 
 	return r < R6_MAX ? s[r] : "?";

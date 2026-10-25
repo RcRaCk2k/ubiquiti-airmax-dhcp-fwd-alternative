@@ -189,6 +189,25 @@ static struct sock_filter bpf_dhcp6[] = {
 	{ 0x06, 0, 0, 0 },
 };
 
+/* client ports: DHCPv6 to port 547, and ICMPv6 (directly or behind a
+ * hop-by-hop header) for the RA guard */
+static struct sock_filter bpf_client6[] = {
+	{ 0x28, 0, 0, 12 },		/* ldh [12]            */
+	{ 0x15, 0, 7, ETH_P_IPV6_ },	/* jne IPv6 -> drop    */
+	{ 0x30, 0, 0, 20 },		/* ldb [20] next hdr   */
+	{ 0x15, 4, 0, 58 },		/* ICMPv6 -> accept    */
+	{ 0x15, 3, 0, 0 },		/* hop-by-hop -> accept */
+	{ 0x15, 0, 3, 17 },		/* jne UDP -> drop     */
+	{ 0x28, 0, 0, 56 },		/* ldh [56] dport      */
+	{ 0x15, 0, 1, DHCP6_SERVER_PORT },
+	{ 0x06, 0, 0, 0xffff },
+	{ 0x06, 0, 0, 0 },
+};
+
+/* ND/MLD of a client port is not limited like DHCP */
+#define ICMP6_RATE	200
+#define ICMP6_BURST	400
+
 /* diagnosis: DHCPv4 (67/68) or DHCPv6 (546/547), either port */
 static struct sock_filter bpf_any_dhcp[] = {
 	{ 0x28, 0, 0, 12 },		/*  0 ldh [12]          */
@@ -272,6 +291,7 @@ struct pstate {
 	int		fd6;		/* DHCPv6, -1 if off */
 	int		ifindex;
 	struct bucket	tb;
+	struct bucket	tb_icmp6;
 	uint32_t	rx;
 	uint32_t	tx;
 };
@@ -290,15 +310,16 @@ static struct pstate ps[MAX_PORTS];
 static struct xid_ent xids[XID_SLOTS];
 static int stats_fd = -1;
 
-static int bucket_take(struct bucket *b, time_t now)
+static int bucket_take(struct bucket *b, time_t now, unsigned rate,
+		       unsigned burst)
 {
-	if (!cfg.rate_pps)
+	if (!rate)
 		return 1;
 	if (now != b->last) {
 		unsigned long t = b->tokens +
-			(unsigned long)(now - b->last) * cfg.rate_pps;
+			(unsigned long)(now - b->last) * rate;
 
-		b->tokens = t > cfg.rate_burst ? cfg.rate_burst : (unsigned)t;
+		b->tokens = t > burst ? burst : (unsigned)t;
 		b->last = now;
 	}
 	if (!b->tokens)
@@ -488,7 +509,14 @@ static ssize_t receive(int port, int v6, uint8_t *buf, size_t cap,
 			st.rx_truncated++;
 			continue;
 		}
-		if (!bucket_take(&ps[port].tb, now)) {
+		if (v6 && n > 20 && buf[20] != 17) {	/* ICMPv6, RA guard */
+			if (!bucket_take(&ps[port].tb_icmp6, now, ICMP6_RATE,
+					 ICMP6_BURST)) {
+				st.icmp6_ratelimited++;
+				continue;
+			}
+		} else if (!bucket_take(&ps[port].tb, now, cfg.rate_pps,
+					cfg.rate_burst)) {
 			(*ratelimited)++;
 			continue;
 		}
@@ -681,6 +709,41 @@ static void log_packet6(const char *ifname, int ifindex, const char *action,
 		id_str(ifid, ifid_len, c, sizeof(c)));
 }
 
+/* RA guard: link-local ICMPv6 of a client port, as the bridge would have
+ * forwarded it: multicast to every other port of the bridge, unicast to
+ * the uplinks (frames for the station itself are not diverted) */
+static int ra_guard(int port, const uint8_t *buf, size_t len)
+{
+	const struct port *p = &cfg.port[port];
+	struct dhcp6_info info;
+	char sm[18], si[40], di[40];
+	uint32_t ok = 0;
+	int i;
+
+	if (dhcp6_ra_guard(buf, len, &info) == VERDICT_DROP) {
+		if (info.reason == R6_RA) {
+			st.ra_dropped++;
+			log_pkt(LOG_LVL_INFO, "ra-drop if=%s/%d src=%s/%s dst=%s",
+				p->name, ps[port].ifindex,
+				mac_str(info.src_mac, sm),
+				ip6_str(info.ip_src, si), ip6_str(info.ip_dst, di));
+		} else {
+			st.icmp6_dropped++;
+		}
+		return 0;
+	}
+	st.icmp6_passed++;
+	for (i = 0; i < cfg.nport; i++) {
+		if (i == port || cfg.port[i].bridge != p->bridge)
+			continue;
+		if (cfg.port[i].role != ROLE_UPLINK && !(buf[0] & 1))
+			continue;
+		if (xmit(i, buf, len, &ok) < 0)
+			return -1;
+	}
+	return 0;
+}
+
 static int handle_client6(int port, time_t now)
 {
 	static uint8_t buf[FRAME_BUF_LEN];
@@ -698,6 +761,11 @@ static int handle_client6(int port, time_t now)
 		if (n < 0)
 			return 0;
 		len = (size_t)n;
+		if (len > 20 && buf[20] != 17) {
+			if (ra_guard(port, buf, len) < 0)
+				return -1;
+			continue;
+		}
 		v = dhcp6_handle_client(buf, &len, sizeof(buf), &p->o6, &info);
 		switch (info.reason) {
 		case R6_WRAPPED:	st.req6_wrapped++; break;
@@ -809,7 +877,7 @@ static void drop_privileges(void)
 static int worker(unsigned restarts)
 {
 	struct sock_fprog preq = BPF(bpf_request), prep = BPF(bpf_reply);
-	struct sock_fprog p6 = BPF(bpf_dhcp6);
+	struct sock_fprog p6 = BPF(bpf_dhcp6), pc6 = BPF(bpf_client6);
 	struct pollfd pfd[2 * MAX_PORTS];
 	int pport[2 * MAX_PORTS], pv6[2 * MAX_PORTS];
 	int i, rc = 0, npfd = 0;
@@ -825,14 +893,18 @@ static int worker(unsigned restarts)
 		if (ps[i].fd < 0)
 			return EXIT_RESTART;
 		ps[i].fd6 = -1;
-		if (cfg.dhcp6_snooping) {
-			ps[i].fd6 = open_packet(p->name, ETH_P_IPV6_, &p6,
+		if (cfg.dhcp6_snooping ||
+		    (cfg.ra_guard && p->role == ROLE_CLIENT)) {
+			ps[i].fd6 = open_packet(p->name, ETH_P_IPV6_,
+						p->role == ROLE_CLIENT ? &pc6 : &p6,
 						&ps[i].ifindex);
 			if (ps[i].fd6 < 0)
 				return EXIT_RESTART;
 		}
 		ps[i].tb.tokens = cfg.rate_burst;
 		ps[i].tb.last = started;
+		ps[i].tb_icmp6.tokens = ICMP6_BURST;
+		ps[i].tb_icmp6.last = started;
 		pfd[npfd] = (struct pollfd){ ps[i].fd, POLLIN, 0 };
 		pport[npfd] = i;
 		pv6[npfd++] = 0;

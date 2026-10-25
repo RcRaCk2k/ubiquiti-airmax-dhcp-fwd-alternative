@@ -112,7 +112,7 @@ struct rule {
 	const char	*notdst;	/* "-d ! MAC" */
 	const char	*sport;
 	const char	*dport;
-	const char	*icmp6_type;	/* instead of UDP ports */
+	int		ll_icmp6;	/* link-local ICMPv6 instead of UDP */
 };
 
 static int add_rule(const struct config *c, const char *ifname,
@@ -135,12 +135,13 @@ static int add_rule(const struct config *c, const char *ifname,
 		a[n++] = (char *)"!";
 		a[n++] = (char *)r->notdst;
 	}
-	a[n++] = (char *)(r->v6 ? "--ip6-proto" : "--ip-proto");
-	if (r->icmp6_type) {
+	if (r->ll_icmp6) {
+		a[n++] = (char *)"--ip6-src";
+		a[n++] = (char *)"fe80::/10";
+		a[n++] = (char *)"--ip6-proto";
 		a[n++] = (char *)"58";	/* /etc/protocols may lack the name */
-		a[n++] = (char *)"--ip6-icmp-type";
-		a[n++] = (char *)r->icmp6_type;
 	} else {
+		a[n++] = (char *)(r->v6 ? "--ip6-proto" : "--ip-proto");
 		a[n++] = (char *)"udp";
 		if (r->sport) {
 			a[n++] = (char *)(r->v6 ? "--ip6-sport" : "--ip-sport");
@@ -172,30 +173,32 @@ static int port_rules(const struct config *c, const struct port *p,
 		 m[0], m[1], m[2], m[3], m[4], m[5]);
 	if (p->role == ROLE_CLIENT) {
 		/* client requests (also unicast renews) to the agent */
-		r[n++] = (struct rule){ 0, NULL, NULL, "67", NULL };
+		r[n++] = (struct rule){ 0, NULL, NULL, "67", 0 };
 		/* snooping: DHCP server behind the customer port */
 		if (c->block_client_servers)
-			r[n++] = (struct rule){ 0, NULL, "67", "68", NULL };
+			r[n++] = (struct rule){ 0, NULL, "67", "68", 0 };
 		if (c->dhcp6_snooping) {
 			/* client messages to the LDRA */
-			r[n++] = (struct rule){ 1, NULL, NULL, "547", NULL };
+			r[n++] = (struct rule){ 1, NULL, NULL, "547", 0 };
 			if (c->block_client_servers)
-				r[n++] = (struct rule){ 1, NULL, "547", "546", NULL };
+				r[n++] = (struct rule){ 1, NULL, "547", "546", 0 };
 		}
-		/* RA guard: router advertisements from the customer */
+		/* RA guard: ebt_ip6 of 2.6.32 cannot match ICMPv6 types, so
+		 * all link-local ICMPv6 (ND, MLD, RA) goes to the agent, which
+		 * drops the RAs and passes the rest on. Not for the station
+		 * itself, so its own neighbour discovery keeps working. */
 		if (c->ra_guard)
-			r[n++] = (struct rule){ 1, NULL, NULL, NULL,
-						"router-advertisement" };
+			r[n++] = (struct rule){ 1, mac, NULL, NULL, 1 };
 	} else {
 		/* server replies, except those for the station itself */
-		r[n++] = (struct rule){ 0, mac, "67", "68", NULL };
+		r[n++] = (struct rule){ 0, mac, "67", "68", 0 };
 		/* snooping: requests of other customers */
 		if (c->block_uplink_requests)
-			r[n++] = (struct rule){ 0, NULL, NULL, "67", NULL };
+			r[n++] = (struct rule){ 0, NULL, NULL, "67", 0 };
 		/* Relay-Replies, and other customers' messages (dropped by
 		 * the agent, RFC 6221 6.2) */
 		if (c->dhcp6_snooping)
-			r[n++] = (struct rule){ 1, NULL, NULL, "547", NULL };
+			r[n++] = (struct rule){ 1, NULL, NULL, "547", 0 };
 	}
 	if (out)
 		for (i = 0; i < n; i++)
