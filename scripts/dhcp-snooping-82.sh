@@ -137,6 +137,13 @@ cmd_deactivate() {
 	# original from the squashfs
 	killall dhcp-fwd 2>/dev/null
 	sleep 2
+	# the original keeps no source guard bindings: never leave its rules
+	# behind, even if our agent could not remove them (e.g. SIGKILL)
+	for h in INPUT FORWARD; do
+		while ebtables -D $h -j DHCP_SNOOPING_82_SG 2>/dev/null; do :; done
+	done
+	ebtables -F DHCP_SNOOPING_82_SG 2>/dev/null
+	ebtables -X DHCP_SNOOPING_82_SG 2>/dev/null
 	log "deactivated, original dhcp-fwd restored"
 }
 

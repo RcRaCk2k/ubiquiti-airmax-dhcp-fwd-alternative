@@ -10,6 +10,9 @@
  *   worker  (uid 99): packet path. Receives only frames the broute rules
  *                   diverted, modifies them and sends them out exactly once
  *                   on the other bridge port.
+ *   Source guard: the worker reports leases (ACK, DHCPv6 Reply, release)
+ *   over a pipe; the watcher keeps the binding table, the lease file and
+ *   the filter rules, so bindings survive a worker restart.
  *
  * Why ETH_P_IP sockets: in Linux 2.6.32 netif_receive_skb() delivers to
  * ETH_P_ALL taps before the bridge hook, but to protocol (ETH_P_IP) handlers
@@ -41,6 +44,7 @@
 #include "dhcp.h"
 #include "dhcp6.h"
 #include "ebt.h"
+#include "guard.h"
 #include "log.h"
 #include "stats.h"
 
@@ -307,6 +311,8 @@ struct xid_ent {
 
 static struct stats st;
 static struct pstate ps[MAX_PORTS];
+static int guard_pipe[2] = { -1, -1 };
+static int guard_fd = -1;		/* worker: write end, -1 = off */
 static struct xid_ent xids[XID_SLOTS];
 static int stats_fd = -1;
 
@@ -375,6 +381,16 @@ static void xid_add(uint32_t xid, const uint8_t *mac, int kind, int port,
 	e->answered = 0;
 	e->port = port;
 	e->t = now;
+}
+
+static void guard_send(const struct guard_msg *m)
+{
+	if (guard_fd < 0)
+		return;
+	if (write(guard_fd, m, sizeof(*m)) == (ssize_t)sizeof(*m))
+		st.guard_msgs++;
+	else
+		st.guard_msgs_lost++;
 }
 
 static void write_stats(time_t started, unsigned restarts)
@@ -529,6 +545,7 @@ static int handle_client(int port, time_t now)
 	static uint8_t buf[FRAME_BUF_LEN];
 	const struct port *p = &cfg.port[port];
 	struct dhcp_info info;
+	struct guard_msg gm;
 	char to[128];
 	int i;
 
@@ -566,6 +583,8 @@ static int handle_client(int port, time_t now)
 		    xmit_role(p->bridge, ROLE_UPLINK, -1, buf, len,
 			      &st.tx_uplink, to, sizeof(to)) < 0)
 			return -1;
+		if (v != VERDICT_DROP && guard_msg4(&info, p->name, 1, &gm))
+			guard_send(&gm);
 		log_packet(p->name, ps[port].ifindex,
 			   v == VERDICT_DROP ? "req-drop" :
 			   v == VERDICT_FORWARD_MODIFIED ? "req-mark" : "req-pass",
@@ -605,6 +624,7 @@ static int handle_uplink(int port, time_t now)
 	static uint8_t buf[FRAME_BUF_LEN];
 	const struct port *p = &cfg.port[port];
 	struct dhcp_info info;
+	struct guard_msg gm;
 	char to[128];
 	int i;
 
@@ -673,6 +693,13 @@ static int handle_uplink(int port, time_t now)
 		    xmit_role(p->bridge, ROLE_CLIENT, target, buf, len,
 			      &st.tx_client, to, sizeof(to)) < 0)
 			return -1;
+		/* source guard: only leases of our own customers, i.e. the
+		 * reply carries our option 82 or answers a request that came
+		 * in on that port; never the station's own address */
+		if (v != VERDICT_DROP && target >= 0 &&
+		    memcmp(info.chaddr, cfg.br[p->bridge].mac, 6) &&
+		    guard_msg4(&info, cfg.port[target].name, 0, &gm))
+			guard_send(&gm);
 		/* foreign drops are routine on a shared segment: debug only */
 		if (v != VERDICT_DROP || log_enabled(LOG_LVL_DEBUG))
 			log_packet(p->name, ps[port].ifindex,
@@ -749,8 +776,9 @@ static int handle_client6(int port, time_t now)
 	static uint8_t buf[FRAME_BUF_LEN];
 	const struct port *p = &cfg.port[port];
 	struct dhcp6_info info;
+	struct guard_msg gm[DHCP6_MAX_LEASES];
 	char to[128];
-	int i;
+	int i, k, ngm;
 
 	for (i = 0; i < BURST_PER_POLL; i++) {
 		ssize_t n = receive(port, 1, buf, sizeof(buf), now,
@@ -766,6 +794,9 @@ static int handle_client6(int port, time_t now)
 				return -1;
 			continue;
 		}
+		/* Release/Decline: read before the frame is wrapped */
+		ngm = guard_fd < 0 ? 0 :
+		      guard_msgs6(buf, len, p->name, 1, gm, DHCP6_MAX_LEASES);
 		v = dhcp6_handle_client(buf, &len, sizeof(buf), &p->o6, &info);
 		switch (info.reason) {
 		case R6_WRAPPED:	st.req6_wrapped++; break;
@@ -785,6 +816,8 @@ static int handle_client6(int port, time_t now)
 		    xmit_role(p->bridge, ROLE_UPLINK, -1, buf, len,
 			      &st.tx_uplink, to, sizeof(to)) < 0)
 			return -1;
+		for (k = 0; v != VERDICT_DROP && k < ngm; k++)
+			guard_send(&gm[k]);
 		log_packet6(p->name, ps[port].ifindex,
 			    v == VERDICT_DROP ? "req6-drop" :
 			    v == VERDICT_FORWARD_MODIFIED ? "req6-relay" :
@@ -813,8 +846,9 @@ static int handle_uplink6(int port, time_t now)
 	static uint8_t buf[FRAME_BUF_LEN];
 	const struct port *p = &cfg.port[port];
 	struct dhcp6_info info;
+	struct guard_msg gm[DHCP6_MAX_LEASES];
 	char to[128];
-	int i;
+	int i, k, ngm;
 
 	for (i = 0; i < BURST_PER_POLL; i++) {
 		ssize_t n = receive(port, 1, buf, sizeof(buf), now,
@@ -853,6 +887,12 @@ static int handle_uplink6(int port, time_t now)
 			      v == VERDICT_FORWARD_MODIFIED ? owner : -1, buf,
 			      len, &st.tx_client, to, sizeof(to)) < 0)
 			return -1;
+		/* the unwrapped Reply: leases of the client behind owner */
+		ngm = v == VERDICT_FORWARD_MODIFIED && guard_fd >= 0 ?
+		      guard_msgs6(buf, len, cfg.port[owner].name, 0, gm,
+				  DHCP6_MAX_LEASES) : 0;
+		for (k = 0; k < ngm; k++)
+			guard_send(&gm[k]);
 		if (v != VERDICT_DROP || log_enabled(LOG_LVL_DEBUG))
 			log_packet6(p->name, ps[port].ifindex,
 				    v == VERDICT_DROP ? "rep6-drop" :
@@ -995,6 +1035,175 @@ static int worker(unsigned restarts)
 }
 
 /* ------------------------------------------------------------------ */
+/* watcher: source guard */
+
+static struct guard_tab gtab;
+static int guard_active;	/* rules in place (grace is over) */
+static int guard_dirty;		/* an incremental change failed: rebuild */
+static time_t guard_from;	/* end of the grace period */
+static time_t guard_retry;	/* after a failed install */
+static const char *guard_why = "";
+
+static void guard_add_cb(const struct binding *b, void *ctx)
+{
+	char s[96];
+
+	LOGI("sg-bind %s", binding_str(b, s));
+	if (guard_active && !guard_dirty && ebt_guard_add(&cfg, b) != 0)
+		guard_dirty = 1;
+}
+
+static void guard_del_cb(const struct binding *b, void *ctx)
+{
+	char s[96];
+
+	LOGI("sg-unbind %s (%s)", binding_str(b, s), guard_why);
+	if (guard_active && !guard_dirty && ebt_guard_del(&cfg, b) != 0)
+		guard_dirty = 1;
+}
+
+static const struct guard_ops guard_ops = { guard_add_cb, guard_del_cb, NULL };
+
+static const char *boot_id(void)
+{
+	static char id[64];
+	char path[192];
+	int fd, n;
+
+	snprintf(path, sizeof(path), "%s/proc/sys/kernel/random/boot_id",
+		 cfg.root);
+	id[0] = '\0';
+	fd = open(path, O_RDONLY);
+	if (fd >= 0) {
+		n = (int)read(fd, id, sizeof(id) - 1);
+		id[n > 0 ? n : 0] = '\0';
+		id[strcspn(id, "\n")] = '\0';
+		close(fd);
+	}
+	return id;
+}
+
+/* the lease file lives in RAM (/var/run): written on every change, renew
+ * included, so a restarted agent continues where it stopped */
+static void guard_save_file(void)
+{
+	static char buf[GUARD_MAX * 96 + 128];
+	char tmp[160];
+	size_t n = guard_save(&gtab, boot_id(), mono(), buf, sizeof(buf));
+	int fd;
+
+	snprintf(tmp, sizeof(tmp), "%s.tmp", cfg.sg_lease_file);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (fd < 0)
+		return;
+	if (write(fd, buf, n) != (ssize_t)n || close(fd) < 0 ||
+	    rename(tmp, cfg.sg_lease_file) < 0) {
+		LOGW("writing %s: %s", cfg.sg_lease_file, strerror(errno));
+		unlink(tmp);
+	}
+}
+
+static int guard_load_file(struct guard_tab *t, const char *bid)
+{
+	static char buf[GUARD_MAX * 96 + 128];
+	int fd = open(cfg.sg_lease_file, O_RDONLY), n;
+
+	t->n = 0;
+	if (fd < 0)
+		return 0;
+	n = (int)read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	buf[n > 0 ? n : 0] = '\0';
+	return guard_load(t, buf, bid, mono());
+}
+
+static int is_client_port(const char *name, void *arg)
+{
+	int i;
+
+	for (i = 0; i < cfg.nport; i++)
+		if (cfg.port[i].role == ROLE_CLIENT &&
+		    !strcmp(cfg.port[i].name, name))
+			return 1;
+	return 0;
+}
+
+static void guard_start(void)
+{
+	int n = guard_load_file(&gtab, boot_id());
+
+	guard_why = "port no longer a client port";
+	if (guard_retain(&gtab, is_client_port, NULL, NULL))
+		guard_save_file();
+	guard_from = mono() + (time_t)cfg.sg_grace;
+	LOGI("source guard: %d bindings from %s, %s", n, cfg.sg_lease_file,
+	     cfg.sg_grace ? "learning only during the grace period" :
+	     "blocking now");
+}
+
+/* A guard that is only half installed could block a customer who has a
+ * valid lease, so on failure the chain goes and the customer is unfiltered
+ * until the next attempt (fail open, unlike the DHCP rules). */
+static void guard_install(void)
+{
+	guard_active = 1;
+	guard_dirty = 0;
+	if (ebt_guard_install(&cfg, &gtab) == 0)
+		return;
+	ebt_guard_remove(&cfg);
+	LOGE("source guard off until the next attempt in %us",
+	     cfg.rule_check_interval);
+	guard_dirty = 1;
+	guard_retry = mono() + (time_t)cfg.rule_check_interval;
+}
+
+/* messages from the worker; called whenever the pipe is readable */
+static void guard_read(time_t now)
+{
+	struct guard_msg m[16];
+	ssize_t n;
+	int i, save = 0;
+
+	while ((n = read(guard_pipe[0], m, sizeof(m))) > 0) {
+		for (i = 0; i < (int)(n / (ssize_t)sizeof(m[0])); i++) {
+			int r;
+
+			m[i].port[sizeof(m[i].port) - 1] = '\0';
+			if (!cfg.sg_enable || !is_client_port(m[i].port, NULL) ||
+			    (m[i].v6 && !(cfg.sg_ipv6 && cfg.dhcp6_snooping)))
+				continue;
+			guard_why = m[i].op == GUARD_LEARN ? "lifetime 0 or replaced" :
+				    m[i].op == GUARD_FORGET ? "released" : "NAK";
+			r = guard_apply(&gtab, &m[i], now, cfg.sg_max_bindings,
+					&guard_ops);
+			if (r == GUARD_FULL)
+				LOGW("source guard: %s has %u bindings, not adding "
+				     "another", m[i].port, cfg.sg_max_bindings);
+			save |= r == GUARD_RENEWED || r == GUARD_CHANGED;
+		}
+	}
+	if (save)
+		guard_save_file();
+}
+
+/* once a second: grace period, expiry, failed changes */
+static void guard_tick(time_t now)
+{
+	if (!cfg.sg_enable)
+		return;
+	if (!guard_active && now >= guard_from) {
+		if (cfg.sg_grace)
+			LOGI("source guard: grace period over, blocking");
+		guard_install();
+	}
+	guard_why = "expired";
+	if (guard_expire(&gtab, now, &guard_ops))
+		guard_save_file();
+	if (guard_active && guard_dirty && now >= guard_retry)
+		guard_install();
+}
+
+/* ------------------------------------------------------------------ */
 /* watcher */
 
 static void run_rollback(void)
@@ -1003,6 +1212,9 @@ static void run_rollback(void)
 
 	LOGE("ROLLBACK: removing rules and running: %s", cfg.rollback_cmd);
 	ebt_remove(&cfg);
+	/* the original dhcp-fwd keeps no bindings: no rules may stay */
+	if (cfg.sg_enable || ebt_guard_exists(&cfg))
+		ebt_guard_remove(&cfg);
 	pid = fork();
 	if (pid == 0) {
 		setsid();
@@ -1054,7 +1266,12 @@ static pid_t start_worker(unsigned restarts)
 	pid_t pid = fork();
 
 	if (pid == 0) {
-		int rc = worker(restarts);
+		int rc;
+
+		if (guard_pipe[0] >= 0)
+			close(guard_pipe[0]);
+		guard_fd = cfg.sg_enable ? guard_pipe[1] : -1;
+		rc = worker(restarts);
 
 		_exit(rc);
 	}
@@ -1073,21 +1290,33 @@ static int watcher(void)
 	if (ebt_install(&cfg) == 0)
 		rules_ok = 1;
 	t_check = mono();
+	if (pipe(guard_pipe) == 0) {
+		fcntl(guard_pipe[0], F_SETFL, O_NONBLOCK);
+		fcntl(guard_pipe[1], F_SETFL, O_NONBLOCK);
+		fcntl(guard_pipe[0], F_SETFD, FD_CLOEXEC);
+		fcntl(guard_pipe[1], F_SETFD, FD_CLOEXEC);
+	} else {
+		LOGE("pipe: %s", strerror(errno));
+	}
+	if (cfg.sg_enable)
+		guard_start();
+	else if (ebt_guard_exists(&cfg))
+		ebt_guard_remove(&cfg);	/* left over by a killed agent */
 
 	while (!sig_stop) {
+		struct pollfd gp = { guard_pipe[0], POLLIN, 0 };
+
 		now = mono();
 		if (child < 0 && now >= t_start) {
 			child = start_worker(restarts);
 			t_start = now;
 		}
-		{
-			/* interrupted early by SIGCHLD/SIGTERM/SIGHUP */
-			struct timespec ts = { 1, 0 };
-
-			nanosleep(&ts, NULL);
-		}
+		/* interrupted early by SIGCHLD/SIGTERM/SIGHUP */
+		if (poll(&gp, guard_pipe[0] >= 0, 1000) > 0)
+			guard_read(mono());
 		if (sig_stop)
 			break;
+		guard_tick(mono());
 		sig_chld = 0;
 		if (child > 0) {
 			int status;
@@ -1119,6 +1348,18 @@ static int watcher(void)
 				rules_ok = ebt_install(&cfg) == 0;
 				if (child > 0)
 					kill(child, SIGTERM);
+				guard_why = "port no longer a client port";
+				if (!cfg.sg_enable && guard_active) {
+					ebt_guard_remove(&cfg);
+					guard_active = 0;
+				} else if (cfg.sg_enable && !guard_active) {
+					guard_start();
+				} else if (cfg.sg_enable) {
+					guard_retain(&gtab, is_client_port, NULL,
+						     NULL);
+					guard_save_file();
+					guard_install();
+				}
 			}
 		}
 		now = mono();
@@ -1134,6 +1375,12 @@ static int watcher(void)
 			} else if (!rules_ok) {
 				rules_ok = 1;
 			}
+			if (guard_active && !guard_dirty &&
+			    ebt_guard_check(&cfg, &gtab) != 1) {
+				LOGW("source guard rules missing (airOS reload?), "
+				     "re-installing");
+				guard_install();
+			}
 		}
 	}
 
@@ -1141,8 +1388,11 @@ static int watcher(void)
 		kill(child, SIGTERM);
 		waitpid(child, NULL, 0);
 	}
-	if (!cfg.keep_rules_on_stop)
+	if (!cfg.keep_rules_on_stop) {
 		ebt_remove(&cfg);
+		if (guard_active)
+			ebt_guard_remove(&cfg);
+	}
 	LOGI("stopped");
 	return 0;
 }
@@ -1299,7 +1549,8 @@ static void usage(void)
 	       "              %%M port MAC, %%%% percent sign\n"
 	       "  -o, --option SECTION.KEY=VALUE, or just SECTION.KEY=VALUE\n"
 	       "              any key of the configuration file, e.g.\n"
-	       "              dhcpv6.snooping=yes dhcpv6.RAguard=yes\n",
+	       "              dhcpv6.snooping=yes dhcpv6.RAguard=yes\n"
+	       "              source_guard.enable=yes source_guard.grace=600\n",
 	       VERSION, DEFAULT_CONFIG);
 }
 
@@ -1350,6 +1601,14 @@ static void print_config(void)
 	       cfg.ra_guard ? "yes" : "no",
 	       cfg.dhcp6_relay_unicast ? "relay" : "forward",
 	       cfg.dhcp6_enterprise);
+	printf("source_guard    %s", cfg.sg_enable ? "yes" : "no");
+	if (cfg.sg_enable)
+		printf(" ipv6=%s block_ip_only=%s grace=%us max_bindings=%u "
+		       "lease_file=%s", cfg.sg_ipv6 && cfg.dhcp6_snooping ? "yes" :
+		       cfg.sg_ipv6 ? "no (needs dhcpv6.snooping)" : "no",
+		       cfg.sg_block_ip_only ? "yes" : "no", cfg.sg_grace,
+		       cfg.sg_max_bindings, cfg.sg_lease_file);
+	printf("\n");
 	printf("rate_limit      %u/s burst %u per port\n", cfg.rate_pps,
 	       cfg.rate_burst);
 	printf("auto_rollback   %d (window %us, min %u)\n", cfg.auto_rollback,
@@ -1375,6 +1634,25 @@ static int status(void)
 	       "(counters: ebtables -t broute -L %s --Lc)\n",
 	       cfg.block_client_servers ? "blocked" : "allowed",
 	       cfg.block_uplink_requests ? "blocked" : "allowed", EBT_CHAIN);
+	if (cfg.sg_enable) {
+		struct guard_tab t;
+		char b[96];
+		int g, i;
+
+		guard_load_file(&t, boot_id());
+		g = ebt_guard_check(&cfg, &t);
+		printf("source_guard_rules %s (counters: ebtables -t filter -L %s "
+		       "--Lc)\n", g == 1 ? "ok" : g == 0 ?
+		       "missing or grace period" : "error", EBT_GUARD_CHAIN);
+		for (i = 0; i < t.n; i++)
+			if (t.b[i].expires)
+				printf("binding %s expires in %lds\n",
+				       binding_str(&t.b[i], b),
+				       (long)(t.b[i].expires - mono()));
+			else
+				printf("binding %s never expires\n",
+				       binding_str(&t.b[i], b));
+	}
 	return r == 1 ? 0 : 1;
 }
 

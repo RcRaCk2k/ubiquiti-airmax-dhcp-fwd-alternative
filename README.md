@@ -27,6 +27,9 @@ from that the bridge is left unchanged. It is not an L3 relay: `giaddr` stays
   ebtables of kernel 2.6.32 cannot match ICMPv6 types, so all link-local
   ICMPv6 of a customer port (neighbour discovery, MLD, RA) goes through the
   agent, which drops the RAs and passes everything else on unchanged.
+* **Source guard** (optional, off by default): on customer ports only the
+  addresses the DHCP server handed out may be used, bound to the client's
+  MAC. Everything else, including spoofed ARP, is dropped.
 
 Analysis and architecture: [docs/ANALYSIS.md](docs/ANALYSIS.md) (German).
 License: MIT ([LICENSE](LICENSE)).
@@ -92,6 +95,44 @@ Relay-Reply, as RFC 6221 requires.
 With `ra_guard` the station itself no longer receives multicast neighbour
 discovery from the customer side, so it cannot be reached over IPv6 from
 the customer's LAN; from the uplink side nothing changes.
+
+### Source guard
+
+`source_guard.enable=yes` turns a customer port into one where only addresses
+the DHCP server handed out can be used (IP source guard plus ARP inspection):
+
+| Option | Meaning |
+|---|---|
+| `source_guard.enable=yes\|no` | default `no` |
+| `source_guard.ipv6=yes\|no` | also guard IPv6 (default `yes`, needs `dhcpv6.snooping=yes`) |
+| `source_guard.block_ip_only=yes\|no` | `yes` (default): only IPv4, ARP and IPv6 are filtered; `no`: PPPoE and every other non-IP frame from the port is dropped too |
+| `source_guard.grace=SECONDS` | learn only, do not block, for this long after the start (default `0`) |
+| `source_guard.max_bindings=N` | bindings per port (default 16) |
+| `source_guard.lease_file=PATH` | default `/var/run/dhcp-snooping-82.leases` |
+
+* **Learning:** a DHCPACK (from the uplink, to the customer port it is
+  delivered to) binds `yiaddr` to `chaddr` for the lease time. A DHCPv6 Reply
+  binds every IA_NA address and IA_PD prefix to the client's MAC for its
+  valid lifetime.
+* **Renew** only moves the expiry in the agent's table; the ebtables rules
+  are not touched. They change only when a binding appears, expires, is
+  released (DHCPRELEASE, DHCPDECLINE, DHCPv6 Release/Decline, valid
+  lifetime 0) or NAKed, or when the client gets another address.
+* **Rules:** a chain `DHCP_SNOOPING_82_SG` in the ebtables filter table,
+  jumped to from `INPUT` and `FORWARD`. Per binding: IPv4 with source MAC +
+  IP, ARP with sender MAC + IP, IPv6 with source MAC + address/prefix. Always
+  allowed: DHCP itself (diverted before the filter table), ARP probes from
+  `0.0.0.0`, IPv6 link-local sources and `::` for duplicate address detection.
+  VLAN tagged IPv4/ARP/IPv6 from a customer port is dropped so it cannot
+  bypass the rules.
+* **Restart:** the binding table is written to the lease file on every change
+  (RAM, no flash wear), so a restarted agent (e.g. after "Apply") restores
+  it. After a reboot the file is gone; the customer's router normally asks
+  again after the link flap. If it may not, because a switch keeps the link
+  up, set a grace period, e.g. `source_guard.grace=600`.
+* Not covered: static addresses, and SLAAC addresses if the upstream router
+  offers SLAAC prefixes on the customer's link. These never appear in a DHCP
+  reply and are blocked.
 
 Rules for explicit ports:
 
@@ -175,6 +216,8 @@ dhcp-fwd --diag 60                           # per socket: ALL = everything, IP/
 ebtables -t broute -L --Lc                   # jump to DHCP_SNOOPING_82 at position 1
 ebtables -t broute -L DHCP_SNOOPING_82 --Lc  # counters = diverted DHCP frames
 ebtables -L --Lc                             # airOS filter; FIREWALL DHCP rules no longer needed
+ebtables -L DHCP_SNOOPING_82_SG --Lc         # source guard: bindings and drops
+cat /var/run/dhcp-snooping-82.leases         # source guard bindings
 
 # processes
 pidof dhcp-fwd; grep " /bin/dhcp-fwd" /proc/mounts
@@ -213,5 +256,11 @@ req-mark if=eth0/2 to=ath0.1284 type=REQUEST xid=0x30336d42 chaddr=1c:ed:6f:00:0
 | other link-local ICMPv6 from a customer port (ND, MLD, echo) | passed on unchanged: multicast to all other ports of the bridge, unicast to the uplink; fragmented ND is dropped (RFC 6980) |
 | worker crashed while `ra_guard` is on | link-local ICMPv6 of the customer is blocked until the worker is back (fail-closed), so IPv6 pauses for that time |
 | worker crashed | rules stay (fail-closed), restart with backoff |
+| source guard: frame from a customer port with a leased source (MAC + IP / prefix) | passed |
+| source guard: any other IPv4, ARP or IPv6 from a customer port | dropped; PPPoE and other frames too with `block_ip_only=no` |
+| source guard: renew | expiry updated internally, rules unchanged |
+| source guard: lease expired, released, declined or NAKed | binding and its rules removed |
+| source guard: worker crashed | bindings and rules stay (the watcher holds them); new leases are bound once the worker is back |
+| source guard: agent stopped or rolled back | rules removed, the customer is unfiltered again |
 | airOS removes the rules (Apply) | re-installed within 5 s; until then the airOS behaviour applies, without duplicates |
 | SIGTERM (relay switched off in the UI, deactivate) | remove rules, exit |

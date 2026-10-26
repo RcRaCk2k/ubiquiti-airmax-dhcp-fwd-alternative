@@ -63,6 +63,12 @@ void config_defaults(struct config *c)
 	c->ra_guard = 1;
 	c->dhcp6_enterprise = 41112;	/* Ubiquiti's private enterprise number */
 	c->dhcp6_relay_unicast = 1;
+	c->sg_enable = 0;
+	c->sg_ipv6 = 1;
+	c->sg_block_ip_only = 1;
+	c->sg_grace = 0;
+	c->sg_max_bindings = 16;
+	copy(c->sg_lease_file, sizeof(c->sg_lease_file), DEFAULT_LEASEFILE);
 	c->existing_o82 = POL_FORWARD;
 	c->reply_foreign = POL_DROP;
 	c->reply_no_o82 = POL_FORWARD;
@@ -283,6 +289,23 @@ static int set_key(struct config *c, const char *sec, const char *key,
 				return -1;
 			return 0;
 		}
+		return -2;
+	}
+	if (!strcasecmp(sec, "source_guard")) {
+		if (!strcasecmp(key, "enable") || !strcasecmp(key, "enabled"))
+			return parse_bool(val, &c->sg_enable);
+		if (!strcasecmp(key, "ipv6"))
+			return parse_bool(val, &c->sg_ipv6);
+		if (!strcasecmp(key, "block_ip_only"))
+			return parse_bool(val, &c->sg_block_ip_only);
+		if (!strcasecmp(key, "grace"))
+			return parse_uint(val, &c->sg_grace, 86400);
+		if (!strcasecmp(key, "max_bindings")) {
+			r = parse_uint(val, &c->sg_max_bindings, 64);
+			return r || !c->sg_max_bindings ? -1 : 0;
+		}
+		if (!strcasecmp(key, "lease_file"))
+			return STR(c->sg_lease_file);
 		return -2;
 	}
 	if (KEY("reply", "foreign_option82"))

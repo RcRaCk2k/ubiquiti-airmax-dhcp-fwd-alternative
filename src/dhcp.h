@@ -64,6 +64,8 @@ struct dhcp_info {
 	uint32_t	ip_src;		/* host byte order */
 	uint32_t	ip_dst;
 	uint8_t		op;
+	uint8_t		htype;
+	uint8_t		hlen;
 	uint8_t		hops;
 	uint8_t		msgtype;	/* 0 = none (BOOTP) */
 	uint16_t	flags;
@@ -72,6 +74,9 @@ struct dhcp_info {
 	uint32_t	yiaddr;
 	uint32_t	giaddr;
 	uint8_t		chaddr[6];
+	uint32_t	lease_time;	/* option 51, if has_lease_time */
+	int		has_lease_time;
+	uint32_t	requested_ip;	/* option 50, 0 = none */
 	int		has_o82;
 	uint8_t		o82_cid[255];
 	uint8_t		o82_cid_len;

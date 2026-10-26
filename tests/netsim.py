@@ -10,6 +10,10 @@
 #   netsim.py client6 IFACE MAC           Solicit/Request/Renew with IA_PD
 #   netsim.py send6 IFACE KIND            ra, rogue-advertise, ...
 #   netsim.py sniff6 IFACE LOG SECONDS    log DHCPv6 and RA frames
+#   netsim.py probe IFACE KIND SRC [MAC]  source guard test frame (udp4, arp,
+#                                         vlan4, udp6, pppoe) tagged with
+#                                         KIND:SRC:MAC
+#   netsim.py sniffp IFACE LOG SECONDS    log the tags of probe frames
 import json
 import random
 import socket
@@ -209,6 +213,12 @@ def send(iface, kind):
         f = frame(BCAST, SERVER_MAC, SERVER_IP, 0xFFFFFFFF, 67, 68,
                   bootp(2, 0xABCDEF01, CLIENT_MAC, 2, yiaddr=LEASE_IP,
                         options=bytes([82, len(raw)]) + raw))
+    elif kind == "release":
+        # the client gives its lease back (unicast, from its address)
+        f = frame(SERVER_MAC, CLIENT_MAC, LEASE_IP, SERVER_IP, 68, 67,
+                  bootp(1, 0x5E1EA5E0, CLIENT_MAC, 7, ciaddr=LEASE_IP,
+                        flags=0, options=struct.pack("!BBI", 54, 4,
+                                                     SERVER_IP)))
     elif kind == "rogue-offer":
         # a DHCP server behind the customer's port
         f = frame(BCAST, CLIENT_MAC, 0xC0A8B201, 0xFFFFFFFF, 67, 68,
@@ -455,6 +465,60 @@ def sniff6(iface, log, seconds):
                 out.flush()
 
 
+# ------------------------------------------------------------------
+# source guard probes
+
+PROBE_TAG = b"ds82probe:"
+SERVER_GUA6 = bytes.fromhex("20010db8000000000000000000000053")
+
+
+def probe(iface, kind, src, mac=None):
+    s = open_sock(iface)
+    macb = bytes.fromhex(mac.replace(":", "")) if mac else CLIENT_MAC
+    tag = PROBE_TAG + ("%s:%s:%s" % (kind, src, macb.hex())).encode()
+    if kind in ("udp4", "vlan4", "arp"):
+        ip = struct.unpack("!I", socket.inet_aton(src))[0]
+    if kind == "udp4":
+        f = frame(SERVER_MAC, macb, ip, SERVER_IP, 4000, 9, tag)
+    elif kind == "vlan4":
+        f = frame(SERVER_MAC, macb, ip, SERVER_IP, 4000, 9, tag)
+        f = f[:12] + b"\x81\x00\x00\x07" + f[12:]	# 802.1Q, VLAN 7
+    elif kind == "arp":
+        # who has the server, tell src; the tag rides in the padding
+        body = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1) + macb + \
+            socket.inet_aton(src) + b"\0" * 6 + struct.pack("!I", SERVER_IP)
+        f = BCAST + macb + b"\x08\x06" + body + tag
+    elif kind == "udp6":
+        a = socket.inet_pton(socket.AF_INET6, src)
+        f = udp6(SERVER_MAC, macb, a, SERVER_GUA6, 4000, 9, tag)
+    elif kind == "pppoe":
+        # PADI: discovery stage, broadcast
+        f = BCAST + macb + b"\x88\x63" + \
+            struct.pack("!BBHH", 0x11, 0x09, 0, 4 + len(tag)) + \
+            struct.pack("!HH", 0x0101, 0) + tag
+    else:
+        raise SystemExit("unknown probe")
+    s.send(f)
+
+
+def sniffp(iface, log, seconds):
+    s = open_sock(iface)
+    end = time.time() + float(seconds)
+    with open(log, "w") as out:
+        while time.time() < end:
+            try:
+                f, addr = s.recvfrom(4096)
+            except socket.timeout:
+                continue
+            if addr[2] == PACKET_OUTGOING:
+                continue
+            i = f.find(PROBE_TAG)
+            if i >= 0:
+                t = f[i + len(PROBE_TAG):].split(b"\0")[0].decode()
+                out.write(t + "\n")
+                out.flush()
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "server":
@@ -473,3 +537,7 @@ if __name__ == "__main__":
         send6(*sys.argv[2:4])
     elif cmd == "sniff6":
         sniff6(*sys.argv[2:5])
+    elif cmd == "probe":
+        probe(*sys.argv[2:6])
+    elif cmd == "sniffp":
+        sniffp(*sys.argv[2:5])

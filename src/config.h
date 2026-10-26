@@ -14,7 +14,9 @@
 #define DEFAULT_PIDFILE		"/var/run/dhcp-fwd.pid"
 #define DEFAULT_STATSFILE	"/var/run/dhcp-snooping-82.stats"
 #define DEFAULT_EBTABLES	"/sbin/ebtables"
+#define DEFAULT_LEASEFILE	"/var/run/dhcp-snooping-82.leases"
 #define EBT_CHAIN		"DHCP_SNOOPING_82"
+#define EBT_GUARD_CHAIN		"DHCP_SNOOPING_82_SG"
 
 #define MAX_BRIDGES		4
 #define MAX_PORTS		16
@@ -77,6 +79,16 @@ struct config {
 	char		dhcp6_rid[256];		/* template, "" = remote_id */
 	unsigned	dhcp6_enterprise;	/* of the Remote-ID option */
 	int		dhcp6_relay_unicast;
+
+	/* source guard: on client ports only addresses the DHCP server
+	 * handed out (ACK, DHCPv6 Reply) may be used, everything else is
+	 * dropped in the ebtables filter table */
+	int		sg_enable;
+	int		sg_ipv6;		/* also IPv6 (needs dhcp6_snooping) */
+	int		sg_block_ip_only;	/* 0: also PPPoE and other frames */
+	unsigned	sg_grace;		/* seconds after start: learn only */
+	unsigned	sg_max_bindings;	/* per port */
+	char		sg_lease_file[128];
 
 	int		existing_o82;		/* POL_FORWARD | POL_DROP */
 	int		reply_foreign;		/* POL_DROP default */

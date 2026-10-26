@@ -52,6 +52,8 @@
 	X(icmp6_passed)		/* ND/MLD of client ports, passed on */	\
 	X(icmp6_dropped)	/* fragmented/truncated, dropped */	\
 	X(icmp6_ratelimited)						\
+	X(guard_msgs)		/* source guard: bindings to the watcher */ \
+	X(guard_msgs_lost)	/* pipe full */				\
 	X(tx_uplink)							\
 	X(tx_client)							\
 	X(tx_error)

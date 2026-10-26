@@ -16,4 +16,15 @@ int ebt_install(const struct config *c);
 int ebt_check(const struct config *c);
 void ebt_remove(const struct config *c);
 
+/* source guard chain in the filter table, built from the binding table */
+struct guard_tab;
+struct binding;
+int ebt_guard_install(const struct config *c, const struct guard_tab *t);
+int ebt_guard_check(const struct config *c, const struct guard_tab *t);
+int ebt_guard_add(const struct config *c, const struct binding *b);
+int ebt_guard_del(const struct config *c, const struct binding *b);
+void ebt_guard_remove(const struct config *c);
+/* 1 if the chain exists (e.g. left over by a killed agent) */
+int ebt_guard_exists(const struct config *c);
+
 #endif

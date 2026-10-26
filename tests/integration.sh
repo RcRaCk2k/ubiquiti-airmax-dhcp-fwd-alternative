@@ -94,15 +94,9 @@ EOF
 }
 broute_off() { nft delete table bridge ds82 2>/dev/null || true; }
 
-# fake ebtables: rules are managed by this script via nft
-cat > "$W/ebtables" <<'EOF'
-#!/bin/sh
-case "$*" in
-*"-L BROUTING"*) echo "Bridge chain: BROUTING, entries: 1, policy: ACCEPT"; echo "-j DHCP_SNOOPING_82 " ;;
-*"-L DHCP_SNOOPING_82"*) echo "Bridge chain: DHCP_SNOOPING_82, entries: 13, policy: RETURN"; for i in $(seq 13); do echo "-j DROP "; done ;;
-esac
-exit 0
-EOF
+# fake ebtables: broute rules are managed by this script via nft, the
+# filter table (source guard) is translated to nft by the fake itself
+cp "$top/tests/fake_ebtables.py" "$W/ebtables"
 chmod +x "$W/ebtables"
 cat > "$W/system.cfg" <<'EOF'
 resolv.host.1.name=cust-example
@@ -127,6 +121,13 @@ start_agent() {
 	"$BIN" -d -C "$W/agent.conf" "$@" > "$W/agent.log" 2>&1 &
 	AGENT=$!
 	sleep 1
+}
+# waits up to 10 s for a line in the agent log
+wait_log() {
+	i=0
+	while ! grep -q -- "$1" "$W/agent.log" && [ $i -lt 100 ]; do
+		sleep 0.1; i=$((i + 1))
+	done
 }
 stop_agent() { kill "$AGENT"; wait "$AGENT" 2>/dev/null || true; AGENT=; }
 
@@ -340,6 +341,153 @@ expect "$(sed -n 's/^rep6_client_msg_dropped //p' "$W/stats")" 1 "counted as rep
 
 stop_agent
 grep -E "^(port|req_inserted|rep_ours|rep_foreign_dropped|req6_wrapped|rep6_ours|tx_error) " "$W/stats" | sed 's/^/  stat /'
+
+# --- 8: source guard -------------------------------------------------
+# probe frames from c0, one "kind source [MAC]" per line on stdin; the
+# tags of the frames that crossed the bridge land in the log
+sg_probe() {
+	ins $SIM sniffp s0.1284 "$1" 2 &
+	SN=$!
+	sleep 0.5
+	while read -r k a m; do inc $SIM probe c0 "$k" "$a" $m < /dev/null; done
+	wait $SN
+}
+crossed() { grep -c "^$1:$2:${4:-021122334455}\$" "$3" || true; }
+sg_chain() {
+	python3 -I -c 'import json,sys; print(int("DHCP_SNOOPING_82_SG" in json.load(open(sys.argv[1]))["chains"]))' "$W/ebt_state.json"
+}
+SG="-u br1:eth0,br1:eth1 -t br1:ath0.1284 source_guard.enable=yes source_guard.lease_file=$W/leases"
+
+echo "8) source guard: only addresses the DHCP server handed out"
+start_agent $SG
+wait_log "source guard rules installed"
+expect "$(count 'source guard rules installed (chain DHCP_SNOOPING_82_SG, 0 bindings, 18 rules)' "$W/agent.log")" 1 "rules for both client ports at start"
+sg_probe "$W/p8a.log" <<EOP
+udp4 10.0.0.100
+arp 10.0.0.100
+arp 0.0.0.0
+udp6 2001:db8:100::1
+udp6 fe80::1
+pppoe -
+EOP
+expect "$(crossed udp4 10.0.0.100 "$W/p8a.log")" 0 "before DHCP: IPv4 blocked"
+expect "$(crossed arp 10.0.0.100 "$W/p8a.log")" 0 "before DHCP: ARP blocked"
+expect "$(crossed arp 0.0.0.0 "$W/p8a.log")" 1 "ARP probe from 0.0.0.0 passes"
+expect "$(crossed udp6 2001:db8:100::1 "$W/p8a.log")" 0 "before DHCPv6: global IPv6 blocked"
+expect "$(crossed udp6 fe80::1 "$W/p8a.log")" 1 "link-local IPv6 passes"
+expect "$(crossed pppoe - "$W/p8a.log")" 1 "PPPoE passes (block_ip_only=yes)"
+
+: > "$W/ebt.log"
+ins $SIM server s0.1284 "$W/server8.log" 5 &
+SRV=$!
+sleep 0.5
+inc $SIM client c0 full > "$W/client8.json"
+wait $SRV
+wait_log "sg-bind eth0 02:11:22:33:44:55 10.0.0.100"
+sleep 0.5
+expect "$(grep -c -- '-I DHCP_SNOOPING_82_SG 1' "$W/ebt.log")" 2 "ACK adds an IPv4 and an ARP rule, RENEW/REBIND add nothing"
+expect "$(grep -c -- '-D DHCP_SNOOPING_82_SG' "$W/ebt.log")" 0 "and remove nothing"
+expect "$(grep -c '^v4 eth0 02:11:22:33:44:55 10.0.0.100 ' "$W/leases")" 1 "binding in the lease file"
+sg_probe "$W/p8b.log" <<EOP
+udp4 10.0.0.100
+udp4 10.0.0.101
+udp4 10.0.0.100 02:de:ad:be:ef:01
+arp 10.0.0.100
+arp 10.0.0.101
+vlan4 10.0.0.100
+EOP
+expect "$(crossed udp4 10.0.0.100 "$W/p8b.log")" 1 "leased address passes"
+expect "$(crossed udp4 10.0.0.101 "$W/p8b.log")" 0 "other address blocked"
+expect "$(crossed udp4 10.0.0.100 "$W/p8b.log" 02deadbeef01)" 0 "leased address from another MAC blocked"
+expect "$(crossed arp 10.0.0.100 "$W/p8b.log")" 1 "ARP for the leased address passes"
+expect "$(crossed arp 10.0.0.101 "$W/p8b.log")" 0 "spoofed ARP blocked"
+expect "$(crossed vlan4 10.0.0.100 "$W/p8b.log")" 0 "VLAN tagged IPv4 blocked"
+
+ins $SIM server6 s0.1284 "$W/server8v6.log" 5 &
+SRV=$!
+sleep 0.5
+inc $SIM client6 c0 02:11:22:33:44:55 > /dev/null
+wait $SRV
+wait_log "sg-bind eth0 02:11:22:33:44:55 2001:db8:100::/56"
+expect "$(grep -c '^v6 eth0 02:11:22:33:44:55 2001:db8:100::/56 ' "$W/leases")" 1 "delegated prefix in the lease file"
+sg_probe "$W/p8c.log" <<EOP
+udp6 2001:db8:100::1
+udp6 2001:db8:100:ff::1
+udp6 2001:db8:200::1
+udp6 2001:db8:100::1 02:de:ad:be:ef:01
+EOP
+expect "$(crossed udp6 2001:db8:100::1 "$W/p8c.log")" 1 "address from the delegated prefix passes"
+expect "$(crossed udp6 2001:db8:100:ff::1 "$W/p8c.log")" 1 "anywhere in the /56"
+expect "$(crossed udp6 2001:db8:200::1 "$W/p8c.log")" 0 "outside the prefix blocked"
+expect "$(crossed udp6 2001:db8:100::1 "$W/p8c.log" 02deadbeef01)" 0 "prefix from another MAC blocked"
+
+: > "$W/ebt.log"
+inc $SIM send c0 release
+wait_log "sg-unbind eth0 02:11:22:33:44:55 10.0.0.100 (released)"
+sleep 0.5
+expect "$(grep -c -- '-D DHCP_SNOOPING_82_SG' "$W/ebt.log")" 2 "RELEASE removes both rules"
+expect "$(grep -c '^v4 ' "$W/leases")" 0 "and the binding"
+sg_probe "$W/p8d.log" <<EOP
+udp4 10.0.0.100
+EOP
+expect "$(crossed udp4 10.0.0.100 "$W/p8d.log")" 0 "released address blocked"
+sleep 1.5
+expect "$(sed -n 's/^guard_msgs_lost //p' "$W/stats")" 0 "no binding message lost"
+stop_agent
+expect "$(sg_chain)" 0 "agent stopped: source guard chain removed"
+
+echo "8b) restart: bindings come back from the lease file"
+start_agent $SG
+wait_log "source guard rules installed"
+expect "$(count 'source guard: 1 bindings from' "$W/agent.log")" 1 "one binding restored"
+sg_probe "$W/p8e.log" <<EOP
+udp6 2001:db8:100::1
+udp4 10.0.0.100
+EOP
+expect "$(crossed udp6 2001:db8:100::1 "$W/p8e.log")" 1 "restored prefix passes"
+expect "$(crossed udp4 10.0.0.100 "$W/p8e.log")" 0 "released address still blocked"
+stop_agent
+
+echo "8c) block_ip_only=no: PPPoE and other frames blocked too"
+start_agent $SG source_guard.block_ip_only=no
+wait_log "source guard rules installed"
+sg_probe "$W/p8f.log" <<EOP
+pppoe -
+udp6 2001:db8:100::1
+EOP
+expect "$(crossed pppoe - "$W/p8f.log")" 0 "PPPoE blocked"
+expect "$(crossed udp6 2001:db8:100::1 "$W/p8f.log")" 1 "bound prefix still passes"
+stop_agent
+
+echo "8d) grace period: learning only, then blocking"
+rm -f "$W/leases"
+start_agent $SG source_guard.grace=4
+sg_probe "$W/p8g.log" <<EOP
+udp4 10.0.0.100
+vlan4 10.0.0.100
+EOP
+expect "$(crossed udp4 10.0.0.100 "$W/p8g.log")" 1 "during the grace period IPv4 passes"
+expect "$(crossed vlan4 10.0.0.100 "$W/p8g.log")" 1 "and VLAN tagged frames too"
+wait_log "grace period over"
+wait_log "source guard rules installed"
+sg_probe "$W/p8h.log" <<EOP
+udp4 10.0.0.100
+EOP
+expect "$(crossed udp4 10.0.0.100 "$W/p8h.log")" 0 "after the grace period blocked"
+stop_agent
+expect "$(sg_chain)" 0 "chain removed again"
+
+echo "8e) ebtables rejects a rule: guard removed, customer unfiltered"
+export DS82_EBT_REJECT=--vlan-encap
+start_agent $SG
+wait_log "source guard off until the next attempt"
+sg_probe "$W/p8i.log" <<EOP
+udp4 10.0.0.100
+EOP
+expect "$(sg_chain)" 0 "no half installed chain"
+expect "$(crossed udp4 10.0.0.100 "$W/p8i.log")" 1 "traffic passes (fail open)"
+stop_agent
+unset DS82_EBT_REJECT
 
 # --- 4: rules present but agent dead: fail closed -------------------
 echo "4) agent stopped, rules kept: DHCP blocked (fail closed)"

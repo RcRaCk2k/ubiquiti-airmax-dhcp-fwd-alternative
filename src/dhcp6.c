@@ -13,7 +13,12 @@
 #define OFF_DHCP	(OFF_UDP + UDP_HDR_LEN)
 #define RELAY_HDR_LEN	34		/* type, hop-count, link, peer */
 
+#define OPT_IA_NA	3
+#define OPT_IA_TA	4
+#define OPT_IAADDR	5
 #define OPT_RELAY_MSG	9
+#define OPT_IA_PD	25
+#define OPT_IAPREFIX	26
 #define OPT_INTERFACE_ID 18
 #define OPT_REMOTE_ID	37
 
@@ -28,6 +33,12 @@ struct parsed6 {
 
 static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
 static void put16(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v & 0xff; }
+
+static uint32_t get32(const uint8_t *p)
+{
+	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+	       (uint32_t)p[2] << 8 | p[3];
+}
 
 static void put32(uint8_t *p, uint32_t v)
 {
@@ -244,6 +255,72 @@ enum verdict dhcp6_handle_client(uint8_t *frame, size_t *len, size_t cap,
 	*len = OFF_UDP + udp_len;
 	info->reason = R6_WRAPPED;
 	return VERDICT_FORWARD_MODIFIED;
+}
+
+/* IAADDR/IAPREFIX options inside one IA option's data */
+static int ia_leases(const uint8_t *d, size_t len, int pd,
+		     struct dhcp6_lease *out, int n, int max)
+{
+	size_t o;
+
+	for (o = 0; o < len;) {
+		uint16_t code, olen;
+
+		if (o + 4 > len)
+			return -1;
+		code = get16(d + o);
+		olen = get16(d + o + 2);
+		if (o + 4 + olen > len)
+			return -1;
+		if (n < max && !pd && code == OPT_IAADDR && olen >= 24) {
+			memcpy(out[n].addr, d + o + 4, 16);
+			out[n].plen = 128;
+			out[n].valid = get32(d + o + 24);
+			n++;
+		} else if (n < max && pd && code == OPT_IAPREFIX && olen >= 25) {
+			out[n].valid = get32(d + o + 8);
+			out[n].plen = d[o + 12];
+			memcpy(out[n].addr, d + o + 13, 16);
+			n += out[n].plen <= 128;
+		}
+		o += 4 + (size_t)olen;
+	}
+	return n;
+}
+
+int dhcp6_leases(const uint8_t *frame, size_t len, struct dhcp6_lease *out,
+		 int max)
+{
+	struct parsed6 p;
+	struct dhcp6_info info;
+	size_t o;
+	int n = 0;
+
+	if (parse((uint8_t *)frame, len, &p, &info) != R6_PARSED ||
+	    info.msgtype == DHCP6_RELAY_FORW || info.msgtype == DHCP6_RELAY_REPL)
+		return -1;
+	for (o = 4; o < p.dlen;) {
+		uint16_t code, olen;
+		size_t skip;
+
+		if (o + 4 > p.dlen)
+			return -1;
+		code = get16(p.d + o);
+		olen = get16(p.d + o + 2);
+		if (o + 4 + olen > p.dlen)
+			return -1;
+		/* IA_NA and IA_PD: IAID, T1, T2; IA_TA: IAID only */
+		skip = code == OPT_IA_TA ? 4 : 12;
+		if ((code == OPT_IA_NA || code == OPT_IA_TA ||
+		     code == OPT_IA_PD) && olen >= skip) {
+			n = ia_leases(p.d + o + 4 + skip, olen - skip,
+				      code == OPT_IA_PD, out, n, max);
+			if (n < 0)
+				return -1;
+		}
+		o += 4 + (size_t)olen;
+	}
+	return n;
 }
 
 int dhcp6_ifid_matches(const struct dhcp6_info *info,

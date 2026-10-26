@@ -169,6 +169,20 @@ check "dhcpv6 keys via -o" \
 	'interface_id6="eth0" remote_id6=""'
 ARGS="dhcpv6.snooping=maybe"
 check "dhcpv6 bad value" 'invalid value for dhcpv6.snooping: maybe'
+ARGS="-u br1:eth0 -t br1:ath0.1284"
+check "source guard off by default" 'source_guard    no'
+ARGS="-u br1:eth0 -t br1:ath0.1284 source_guard.enable=yes"
+check "source guard defaults" \
+	'source_guard    yes ipv6=yes block_ip_only=yes grace=0s max_bindings=16 lease_file=/var/run/dhcp-snooping-82.leases'
+ARGS="-u br1:eth0 -t br1:ath0.1284 source_guard.enable=yes source_guard.grace=600 source_guard.block_ip_only=no source_guard.max_bindings=4"
+check "source guard options" \
+	'source_guard    yes ipv6=yes block_ip_only=no grace=600s max_bindings=4'
+ARGS="-u br1:eth0 -t br1:ath0.1284 source_guard.enable=yes dhcpv6.snooping=no"
+check "IPv6 source guard needs DHCPv6 snooping" 'ipv6=no (needs dhcpv6.snooping)'
+ARGS="source_guard.max_bindings=0"
+check "source guard bad value" 'invalid value for source_guard.max_bindings: 0'
+ARGS="source_guard.bogus=1"
+check "source guard unknown key" 'unknown option source_guard.bogus'
 ARGS="-o nosuch.key=1"
 check "-o unknown key" 'unknown option nosuch.key'
 ARGS="-o foo"

@@ -10,7 +10,8 @@ ZIG        ?= $(CURDIR)/.toolchain/zig-linux-x86_64-0.13.0/zig
 TARGET     := mips-linux-musl
 MCPU       := mips32r2+soft_float
 
-SRCS       := src/main.c src/dhcp.c src/dhcp6.c src/config.c src/ebt.c src/log.c
+SRCS       := src/main.c src/dhcp.c src/dhcp6.c src/guard.c src/config.c \
+              src/ebt.c src/log.c
 HDRS       := $(wildcard src/*.h)
 WARN       := -Wall -Wextra -Wshadow -Wpointer-arith -Wstrict-prototypes \
               -Wno-unused-parameter
@@ -53,9 +54,16 @@ $(BUILD)/test_dhcp6: tests/test_dhcp6.c src/dhcp6.c src/dhcp6.h src/dhcp.h
 	$(CC) -O1 -g -fsanitize=address,undefined $(WARN) $(DEFS) -Isrc \
 		-o $@ tests/test_dhcp6.c src/dhcp6.c
 
-test: $(BUILD)/test_dhcp $(BUILD)/test_dhcp6 host
+$(BUILD)/test_guard: tests/test_guard.c src/guard.c src/guard.h src/dhcp6.c \
+		src/dhcp6.h src/dhcp.h
+	@mkdir -p $(dir $@)
+	$(CC) -O1 -g -fsanitize=address,undefined $(WARN) $(DEFS) -Isrc \
+		-o $@ tests/test_guard.c src/guard.c src/dhcp6.c
+
+test: $(BUILD)/test_dhcp $(BUILD)/test_dhcp6 $(BUILD)/test_guard host
 	cd $(BUILD) && ./test_dhcp
 	cd $(BUILD) && ./test_dhcp6
+	cd $(BUILD) && ./test_guard
 	sh tests/test_detect.sh
 	@if command -v tshark >/dev/null; then sh tests/check_pcap.sh $(BUILD)/test_out.pcap; \
 		sh tests/check_pcap6.sh $(BUILD)/test6_out.pcap; fi

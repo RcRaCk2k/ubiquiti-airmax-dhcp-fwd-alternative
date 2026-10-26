@@ -13,6 +13,8 @@
 
 #define OPT_PAD		0
 #define OPT_END		255
+#define OPT_REQ_IP	50
+#define OPT_LEASE_TIME	51
 #define OPT_MSGTYPE	53
 #define OPT_OVERLOAD	52
 #define OPT_RELAY	82
@@ -125,6 +127,11 @@ static int scan_field(struct parsed *p, size_t start, size_t stop, int main,
 			return -1;
 		if (code == OPT_MSGTYPE && l >= 1)
 			info->msgtype = b[i + 2];
+		else if (code == OPT_LEASE_TIME && l == 4) {
+			info->lease_time = get32(b + i + 2);
+			info->has_lease_time = 1;
+		} else if (code == OPT_REQ_IP && l == 4)
+			info->requested_ip = get32(b + i + 2);
 		else if (code == OPT_OVERLOAD && main && l >= 1)
 			*overload = b[i + 2];
 		else if (code == OPT_RELAY) {
@@ -189,6 +196,8 @@ static enum reason parse(uint8_t *f, size_t len, struct parsed *p,
 	p->blen = udp_len - 8;
 
 	info->op = b[0];
+	info->htype = b[1];
+	info->hlen = b[2];
 	info->hops = b[3];
 	info->xid = get32(b + 4);
 	info->flags = get16(b + 10);

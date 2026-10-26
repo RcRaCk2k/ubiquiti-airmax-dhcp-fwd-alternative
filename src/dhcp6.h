@@ -115,6 +115,21 @@ enum verdict dhcp6_handle_uplink(uint8_t *frame, size_t *len,
 enum verdict dhcp6_ra_guard(const uint8_t *frame, size_t len,
 			    struct dhcp6_info *info);
 
+/* address (IA_NA, IA_TA) or delegated prefix (IA_PD) of a DHCPv6 message */
+struct dhcp6_lease {
+	uint8_t		addr[16];
+	uint8_t		plen;		/* 128 for addresses */
+	uint32_t	valid;		/* valid lifetime, 0xffffffff = infinite */
+};
+
+#define DHCP6_MAX_LEASES	16
+
+/* The addresses and prefixes in the IA options of the plain (not relayed)
+ * DHCPv6 message in frame, at most max. Returns how many, or -1 if the
+ * frame or its options are broken. */
+int dhcp6_leases(const uint8_t *frame, size_t len, struct dhcp6_lease *out,
+		 int max);
+
 /* 1 if the Interface-ID decoded into info is cfg's */
 int dhcp6_ifid_matches(const struct dhcp6_info *info,
 		       const struct ldra_cfg *cfg);
