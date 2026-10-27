@@ -2,12 +2,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 The dhcp-snooping-82 authors
 #
-# dhcp-snooping-82 control script for airOS 8 (busybox sh).
+# dhcp-snooping-82 control script for airOS 6 and 8 (busybox sh).
 #
 # The agent replaces the airOS dhcp-fwd by bind-mounting our binary over
 # /bin/dhcp-fwd (squashfs, read-only). airOS init keeps starting
 # "/bin/dhcp-fwd" as before, so the DHCP relay switch in the web UI still
 # enables/disables the agent.
+#
+# Without a relay switch (airOS 6) the bridge comment in the web UI enables
+# it: a word "dhcp-option-82=yes" anywhere in the comment. "ensure" then
+# adds the respawn line airOS would write for the relay to /etc/inittab
+# (rebuilt by airOS on every Apply, after which "ensure" runs again).
 #
 # Boot: "install" adds an "ensure" line to /etc/persistent/rc.poststart.
 # Only CS (custom script) firmware runs it; standard airOS 8.7 firmware runs
@@ -47,6 +52,36 @@ die() { log "ERROR: $*"; exit 1; }
 is_active() { grep -q " $TARGET[ \\]" /proc/mounts; }
 
 relay_enabled() { grep -q '^dhcprelay.status=enabled' /tmp/system.cfg; }
+
+# "dhcp-option-82=yes" as a word of a bridge comment, like the agent reads it
+comment_enabled() {
+	grep -Eiq '^bridge\.[0-9]+\.comment=(.*[ ,;])?dhcp-option-82=(yes|true|on|1)([ ,;]|$)' \
+		/tmp/system.cfg
+}
+
+wanted() { relay_enabled || comment_enabled; }
+
+# the line airOS writes when the relay is enabled
+INITTAB=/etc/inittab
+INITTAB_LINE="null::respawn:$TARGET -n -c /etc/dhcp-fwd.conf"
+
+# without the airOS relay the respawn line is ours: add or remove it
+sync_inittab() {
+	relay_enabled && return 0
+	if comment_enabled; then
+		grep -qF "$INITTAB_LINE" "$INITTAB" && return 0
+		echo "$INITTAB_LINE" >> "$INITTAB" || die "write $INITTAB"
+		log "enabled by bridge comment: respawn line added to $INITTAB"
+	else
+		grep -qF "$INITTAB_LINE" "$INITTAB" || return 0
+		grep -vF "$INITTAB_LINE" "$INITTAB" > "$INITTAB.new" &&
+			mv "$INITTAB.new" "$INITTAB" || die "write $INITTAB"
+		log "no longer enabled: respawn line removed from $INITTAB"
+		# init does not stop a process whose line is gone
+		killall dhcp-fwd 2>/dev/null
+	fi
+	kill -HUP 1
+}
 
 save_flash() {
 	log "saving /etc/persistent to flash (cfgmtd)"
@@ -90,10 +125,10 @@ cmd_install() {
 	return 0
 }
 
-# --check needs a bridge with the relay enabled; without one init does not
-# start dhcp-fwd at all, so only the binary itself can be checked
+# --check needs a bridge with the relay or the comment enabled; without one
+# init does not start dhcp-fwd at all, so only the binary can be checked
 self_check() {
-	relay_enabled || { "$BIN" -v >/dev/null 2>&1; return; }
+	wanted || { "$BIN" -v >/dev/null 2>&1; return; }
 	"$BIN" --check >/dev/null 2>&1
 }
 
@@ -110,7 +145,7 @@ health_check() {
 cmd_activate() {
 	[ -x "$BIN" ] || die "not installed"
 	self_check || die "binary self check failed, staying on original"
-	relay_enabled || log "WARNING: DHCP relay disabled in airOS, agent will not be started by init"
+	wanted || log "WARNING: neither DHCP relay nor dhcp-option-82=yes in a bridge comment, agent will not be started by init"
 	# "install" replaces the binary with a new file: mount that one
 	if is_active && ! [ "$BIN" -ef "$TARGET" ]; then
 		umount -l "$TARGET" || die "umount of old binary failed"
@@ -121,7 +156,8 @@ cmd_activate() {
 	rm -f "$MARKER"
 	# init respawns /bin/dhcp-fwd, which now is our binary
 	killall dhcp-fwd 2>/dev/null
-	relay_enabled || { log "activated (idle until relay is enabled)"; return 0; }
+	sync_inittab
+	wanted || { log "activated (idle until relay or comment is enabled)"; return 0; }
 	if health_check; then
 		log "activated: $("$BIN" -v), rules ok"
 		return 0
@@ -138,6 +174,11 @@ cmd_deactivate() {
 	# our agent removes its broute rules on SIGTERM; init respawns the
 	# original from the squashfs
 	killall dhcp-fwd 2>/dev/null
+	# the original dhcp-fwd is started only by the airOS relay
+	if ! relay_enabled && grep -qF "$INITTAB_LINE" "$INITTAB"; then
+		grep -vF "$INITTAB_LINE" "$INITTAB" > "$INITTAB.new" &&
+			mv "$INITTAB.new" "$INITTAB" && kill -HUP 1
+	fi
 	sleep 2
 	# the original keeps no source guard bindings: never leave its rules
 	# behind, even if our agent could not remove them (e.g. SIGKILL)
@@ -158,6 +199,10 @@ cmd_rollback() {
 cmd_ensure() {
 	[ -f "$MARKER" ] && { echo "rolled back, not activating"; return 0; }
 	if is_active; then
+		sync_inittab
+		# after an Apply: the bridge comment may have changed (airOS 8
+		# restarts dhcp-fwd anyway, airOS 6 without relay does not)
+		killall -HUP dhcp-fwd 2>/dev/null
 		echo "active"
 		return 0
 	fi
@@ -169,6 +214,8 @@ cmd_status() {
 	else echo "mode: original airOS dhcp-fwd"; fi
 	[ -f "$MARKER" ] && echo "rollback marker: set"
 	relay_enabled && echo "airOS relay: enabled" || echo "airOS relay: disabled"
+	comment_enabled && echo "bridge comment: dhcp-option-82=yes" ||
+		echo "bridge comment: no dhcp-option-82=yes"
 	echo "processes: $(pidof dhcp-fwd)"
 	[ -x "$BIN" ] && "$BIN" --status
 }

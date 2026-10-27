@@ -107,15 +107,26 @@ static char *trim(char *s)
 
 static int parse_bool(const char *v, int *out)
 {
-	if (!strcmp(v, "true") || !strcmp(v, "yes") || !strcmp(v, "1") ||
-	    !strcmp(v, "on"))
+	if (!strcasecmp(v, "true") || !strcasecmp(v, "yes") ||
+	    !strcmp(v, "1") || !strcasecmp(v, "on"))
 		*out = 1;
-	else if (!strcmp(v, "false") || !strcmp(v, "no") || !strcmp(v, "0") ||
-		 !strcmp(v, "off"))
+	else if (!strcasecmp(v, "false") || !strcasecmp(v, "no") ||
+		 !strcmp(v, "0") || !strcasecmp(v, "off"))
 		*out = 0;
 	else
 		return -1;
 	return 0;
+}
+
+static int parse_frame_types(const char *val)
+{
+	if (!strcasecmp(val, "any"))
+		return FT_ANY;
+	if (!strcasecmp(val, "untagged-only"))
+		return FT_UNTAGGED;
+	if (!strcasecmp(val, "vlan-only"))
+		return FT_VLAN;
+	return -1;
 }
 
 static int parse_uint(const char *v, unsigned *out, unsigned max)
@@ -254,6 +265,8 @@ static int set_key(struct config *c, const char *sec, const char *key,
 		return STR(c->client_prefix);
 	if (KEY("interface", "uplink_prefix"))
 		return STR(c->uplink_prefix);
+	if (KEY("interface", "frame_types"))
+		return (c->frame_types = parse_frame_types(val)) < 0 ? -1 : 0;
 	if (KEY("interface", "mtu")) {
 		r = parse_uint(val, &u, 1500);
 		if (r || u < 576)
@@ -693,31 +706,92 @@ static int add_bridge(struct config *c, const char *name)
 			return 0;
 	if (c->nbr == MAX_BRIDGES)
 		return -1;
+	memset(&c->br[c->nbr], 0, sizeof(c->br[0]));
 	copy(c->br[c->nbr].name, IFNAMSIZ, name);
 	c->nbr++;
 	return 0;
 }
 
-/* bridges with DHCP relay (option 82) enabled in airOS:
- *   dhcprelay.status=enabled
- *   dhcprelay.client.N.devname=br1 / dhcprelay.client.N.status=enabled */
-static int detect_bridges(struct config *c, char *err, size_t errlen)
+static void del_bridge(struct config *c, const char *name)
 {
-	static char buf[32768];
-	char key[64], val[64];
 	int i;
 
-	if (read_file(c->system_cfg, buf, sizeof(buf)) < 0) {
+	for (i = 0; i < c->nbr; i++)
+		if (!strcmp(c->br[i].name, name)) {
+			memmove(&c->br[i], &c->br[i + 1],
+				(size_t)(c->nbr - i - 1) * sizeof(c->br[0]));
+			c->nbr--;
+			return;
+		}
+}
+
+/* value of a "key=value" word in an airOS comment field, e.g.
+ * bridge.1.comment=Kunde X; dhcp-option-82=yes frame-types=untagged-only
+ * Words are separated by blanks, commas or semicolons, keys ignore case,
+ * other words are ignored. 1 if found. */
+static int comment_word(const char *comment, const char *key, char *out,
+			size_t n)
+{
+	size_t kl = strlen(key);
+	const char *p = comment;
+
+	while (*p) {
+		size_t l;
+
+		p += strspn(p, " \t,;");
+		l = strcspn(p, " \t,;");
+		if (l > kl && p[kl] == '=' && !strncasecmp(p, key, kl)) {
+			size_t v = l - kl - 1;
+
+			if (v >= n)
+				v = n - 1;
+			memcpy(out, p + kl + 1, v);
+			out[v] = '\0';
+			return 1;
+		}
+		p += l;
+	}
+	return 0;
+}
+
+/* comment of bridge.N with bridge.N.devname=name, "" if none */
+static const char *bridge_comment(const char *buf, const char *name,
+				  char *out, size_t n)
+{
+	char key[64], dev[IFNAMSIZ];
+	int i;
+
+	out[0] = '\0';
+	for (i = 1; i <= 16; i++) {
+		snprintf(key, sizeof(key), "bridge.%d.devname", i);
+		if (strcmp(syscfg_get(buf, key, dev, sizeof(dev)), name))
+			continue;
+		snprintf(key, sizeof(key), "bridge.%d.comment", i);
+		return syscfg_get(buf, key, out, n);
+	}
+	return out;
+}
+
+static char syscfg_buf[32768];
+
+/* bridges with DHCP relay (option 82) enabled in airOS:
+ *   dhcprelay.status=enabled
+ *   dhcprelay.client.N.devname=br1 / dhcprelay.client.N.status=enabled
+ * The web UI of airOS 6 has no relay switch for a bridge, so the bridge
+ * comment can enable it ("dhcp-option-82=yes") or disable it ("=no"). */
+static int detect_bridges(struct config *c, char *err, size_t errlen)
+{
+	char *buf = syscfg_buf;
+	char key[64], val[64], com[256];
+	int i, on, relay;
+
+	if (read_file(c->system_cfg, buf, sizeof(syscfg_buf)) < 0) {
 		snprintf(err, errlen, "%s: %s", c->system_cfg, strerror(errno));
 		return -1;
 	}
-	if (strcmp(syscfg_get(buf, "dhcprelay.status", val, sizeof(val)),
-		   "enabled")) {
-		snprintf(err, errlen, "DHCP relay not enabled in %s",
-			 c->system_cfg);
-		return -1;
-	}
-	for (i = 1; i <= 16; i++) {
+	relay = !strcmp(syscfg_get(buf, "dhcprelay.status", val, sizeof(val)),
+			"enabled");
+	for (i = 1; relay && i <= 16; i++) {
 		char dev[IFNAMSIZ];
 
 		snprintf(key, sizeof(key), "dhcprelay.client.%d.devname", i);
@@ -732,12 +806,52 @@ static int detect_bridges(struct config *c, char *err, size_t errlen)
 			return -1;
 		}
 	}
+	for (i = 1; i <= 16; i++) {
+		char dev[IFNAMSIZ];
+
+		snprintf(key, sizeof(key), "bridge.%d.devname", i);
+		if (!syscfg_get(buf, key, dev, sizeof(dev))[0])
+			continue;
+		snprintf(key, sizeof(key), "bridge.%d.comment", i);
+		if (!comment_word(syscfg_get(buf, key, com, sizeof(com)),
+				  "dhcp-option-82", val, sizeof(val)) ||
+		    parse_bool(val, &on) < 0)
+			continue;
+		if (!on) {
+			del_bridge(c, dev);
+			continue;
+		}
+		if (add_bridge(c, dev) < 0) {
+			snprintf(err, errlen, "too many bridges");
+			return -1;
+		}
+		c->br[c->nbr - 1].by_comment = 1;
+	}
 	if (!c->nbr) {
-		snprintf(err, errlen, "no bridge with DHCP relay enabled in %s",
+		snprintf(err, errlen, "no bridge with DHCP relay enabled or "
+			 "dhcp-option-82=yes in its comment in %s",
 			 c->system_cfg);
-		return -1;
+		return CONFIG_NO_BRIDGE;
 	}
 	return 0;
+}
+
+/* frame-types=... in a bridge comment overrides interface.frame_types */
+static void bridge_frame_types(struct config *c)
+{
+	char com[256], val[32];
+	int i, ft, have;
+
+	have = read_file(c->system_cfg, syscfg_buf, sizeof(syscfg_buf)) >= 0;
+	for (i = 0; i < c->nbr; i++) {
+		c->br[i].frame_types = c->frame_types;
+		if (have &&
+		    comment_word(bridge_comment(syscfg_buf, c->br[i].name, com,
+						sizeof(com)),
+				 "frame-types", val, sizeof(val)) &&
+		    (ft = parse_frame_types(val)) >= 0)
+			c->br[i].frame_types = ft;
+	}
 }
 
 static int bridges_from_list(struct config *c, char *err, size_t errlen)
@@ -945,7 +1059,7 @@ static int auto_ports(struct config *c, char *err, size_t errlen)
 	r = !strcmp(c->bridges_spec, "auto") ? detect_bridges(c, err, errlen)
 					     : bridges_from_list(c, err, errlen);
 	if (r < 0)
-		return -1;
+		return r;
 
 	/* keep only bridges that have client and uplink ports */
 	memcpy(br, c->br, sizeof(br));
@@ -965,7 +1079,7 @@ static int auto_ports(struct config *c, char *err, size_t errlen)
 	if (!c->nbr) {
 		snprintf(err, errlen, "no bridge with both a client (%s) and an "
 			 "uplink (%s) port", c->client_prefix, c->uplink_prefix);
-		return -1;
+		return CONFIG_NO_BRIDGE;
 	}
 	return 0;
 }
@@ -1013,7 +1127,8 @@ int config_resolve(struct config *c, char *err, size_t errlen)
 	r = c->nxport ? explicit_ports(c, err, errlen)
 		      : auto_ports(c, err, errlen);
 	if (r < 0)
-		return -1;
+		return r;
+	bridge_frame_types(c);
 
 	for (k = 0; k < c->nport; k++) {
 		struct port *p = &c->port[k];

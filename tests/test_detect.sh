@@ -126,7 +126,30 @@ refute "only br1" 'bridge          br2'
 echo "detect: relay disabled globally"
 sed -i 's/^dhcprelay.status=enabled/dhcprelay.status=disabled/' "$W/system.cfg"
 conf ""
-check "refuses to run" 'DHCP relay not enabled'
+check "refuses to run" 'no bridge with DHCP relay enabled or dhcp-option-82=yes'
+
+echo "detect: bridge comment (airOS 6 has no relay switch)"
+cp "$W/system.cfg" "$W/system.cfg.orig"
+cat >> "$W/system.cfg" <<'EOF'
+bridge.1.devname=br0
+bridge.1.comment=xdhcp-option-82=yes
+bridge.2.devname=br1
+bridge.2.comment=Kunde X; DHCP-Option-82=Yes,frame-types=untagged-only
+EOF
+check "dhcp-option-82=yes among other words" \
+	'bridge          br1 mac=00:00:5e:00:53:21 frame_types=untagged-only (enabled by comment)' \
+	'port            br1/eth0 client (lower eth0)'
+refute "only whole words count" 'bridge          br0'
+ARGS="-u br1:eth0 -t br1:ath0.1284"
+check "frame-types from the comment with explicit ports" \
+	'bridge          br1 mac=00:00:5e:00:53:21 frame_types=untagged-only'
+ARGS="-u br1:eth0 -t br1:ath0.1284 interface.frame_types=vlan-only"
+check "comment wins over the default" 'frame_types=untagged-only'
+unset ARGS
+sed -i 's/^dhcprelay.status=disabled/dhcprelay.status=enabled/; s/DHCP-Option-82=Yes/dhcp-option-82=no/' "$W/system.cfg"
+check "dhcp-option-82=no disables a relay bridge" 'bridge          br2'
+refute "br1 disabled by its comment" 'bridge          br1'
+cp "$W/system.cfg.orig" "$W/system.cfg"
 
 echo "explicit: ports from the command line (relay still disabled)"
 ARGS="-u br1:eth0 -t br1:ath0.1284"
@@ -185,6 +208,14 @@ ARGS="-u br1:eth0 -t br1:ath0.1284 source_guard.enable=yes source_guard.slaac=no
 check "source guard SLAAC off" 'slaac=no'
 ARGS="source_guard.slaac=maybe"
 check "source guard bad SLAAC mode" 'invalid value for source_guard.slaac: maybe'
+ARGS="-u br1:eth0 -t br1:ath0.1284"
+check "frame types default" 'frame_types     any'
+ARGS="-u br1:eth0 -t br1:ath0.1284 interface.frame_types=untagged-only"
+check "frame types untagged-only" 'frame_types     untagged-only'
+ARGS="-u br1:eth0 -t br1:ath0.1284 interface.frame_types=vlan-only"
+check "frame types vlan-only" 'frame_types     vlan-only'
+ARGS="interface.frame_types=tagged"
+check "frame types bad value" 'invalid value for interface.frame_types: tagged'
 ARGS="source_guard.max_bindings=0"
 check "source guard bad value" 'invalid value for source_guard.max_bindings: 0'
 ARGS="source_guard.bogus=1"

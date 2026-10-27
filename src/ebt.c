@@ -107,6 +107,9 @@ static int run(const struct config *c, char *const argv[], char *out,
 	} while (0)
 
 static int jump_count(const struct config *c);
+static int ft_install(const struct config *c);
+static int ft_check(const struct config *c);
+static void ft_remove(const struct config *c);
 
 struct rule {
 	int		v6;
@@ -170,6 +173,9 @@ static int port_rules(const struct config *c, const struct port *p,
 	int n = 0, i;
 
 	memset(r, 0, sizeof(r));
+	/* vlan-only: untagged frames, DHCP included, are not ours */
+	if (c->br[p->bridge].frame_types == FT_VLAN)
+		return 0;
 	snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
 		 m[0], m[1], m[2], m[3], m[4], m[5]);
 	if (p->role == ROLE_CLIENT) {
@@ -261,6 +267,8 @@ int ebt_install(const struct config *c)
 		if (rc != 0)
 			goto fail;
 	}
+	if ((rc = ft_install(c)) != 0)
+		goto fail;
 	if (ebt_check(c) != 1)
 		goto fail;
 	LOGI("broute rules installed (chain %s, %d rules)", EBT_CHAIN,
@@ -327,7 +335,7 @@ int ebt_check(const struct config *c)
 		return 0;
 	if (count(buf, "-j DROP") != n)
 		return 0;
-	return 1;
+	return ft_check(c);
 }
 
 void ebt_remove(const struct config *c)
@@ -343,6 +351,7 @@ void ebt_remove(const struct config *c)
 	EBT((char *)"-F", (char *)EBT_CHAIN);
 	EBT((char *)"-X", (char *)EBT_CHAIN);
 	(void)rc;
+	ft_remove(c);
 	LOGI("broute rules removed");
 }
 
@@ -383,10 +392,42 @@ static int guard_v6(const struct config *c)
 	return c->sg_ipv6 && c->dhcp6_snooping;
 }
 
+static int run_args(const struct config *c, struct args *a)
+{
+	return run(c, a->a, NULL, 0);
+}
+
+/* airOS 6 ships no ebt_arp: then IPv4 is bound but ARP passes. Probed
+ * once in a scratch chain, so a listing of ours never changes. */
+int ebt_guard_arp(const struct config *c)
+{
+	static int arp_ok = -1;
+	struct args a;
+
+	if (arp_ok >= 0)
+		return arp_ok;
+	args_start(&a, "-N", EBT_GUARD_CHAIN "_P");
+	run_args(c, &a);
+	args_start(&a, "-A", EBT_GUARD_CHAIN "_P");
+	arg(&a, "-p");
+	arg(&a, "ARP");
+	arg(&a, "--arp-ip-src");
+	arg(&a, "0.0.0.0");
+	arg(&a, "-j");
+	arg(&a, "RETURN");
+	arp_ok = run_args(c, &a) == 0;
+	args_start(&a, "-X", EBT_GUARD_CHAIN "_P");
+	run_args(c, &a);
+	if (!arp_ok)
+		LOGW("ebtables cannot match ARP (no ebt_arp): source guard "
+		     "binds IPv4 only, ARP is not filtered");
+	return arp_ok;
+}
+
 /* the 1 or 2 rules of a binding: spec k (0, 1) appended to a */
 static int binding_rules(const struct config *c, const struct binding *b)
 {
-	return b->v6 ? guard_v6(c) : 2;
+	return b->v6 ? guard_v6(c) : 1 + ebt_guard_arp(c);
 }
 
 static void binding_spec(struct args *a, const struct binding *b, int k)
@@ -437,6 +478,7 @@ static int port_guard_rules(const struct config *c, const char *port,
 					     "0.0.0.0", "-j", "RETURN", NULL };
 	static const char *const ip4[] = { "-p", "IPv4", "-j", "DROP", NULL };
 	static const char *const arp[] = { "-p", "ARP", "-j", "DROP", NULL };
+	static const char *const passarp[] = { "-p", "ARP", "-j", "RETURN", NULL };
 	static const char *const ip6[] = { "-p", "IPv6", "-j", "DROP", NULL };
 	static const char *const pass6[] = { "-p", "IPv6", "-j", "RETURN", NULL };
 	/* VLAN tagged IP would bypass the rules above */
@@ -453,9 +495,15 @@ static int port_guard_rules(const struct config *c, const char *port,
 		list[n++] = ll6;
 		list[n++] = dad6;
 	}
-	list[n++] = probe;
-	list[n++] = ip4;
-	list[n++] = arp;
+	if (ebt_guard_arp(c)) {
+		list[n++] = probe;
+		list[n++] = ip4;
+		list[n++] = arp;
+	} else {
+		list[n++] = ip4;
+		if (!c->sg_block_ip_only)
+			list[n++] = passarp;	/* not caught by "all" */
+	}
 	if (guard_v6(c))
 		list[n++] = ip6;
 	else if (!c->sg_block_ip_only)
@@ -487,11 +535,6 @@ static int guard_expected(const struct config *c, const struct guard_tab *t)
 	for (i = 0; i < t->n; i++)
 		n += binding_rules(c, &t->b[i]);
 	return n;
-}
-
-static int run_args(const struct config *c, struct args *a)
-{
-	return run(c, a->a, NULL, 0);
 }
 
 int ebt_guard_add(const struct config *c, const struct binding *b)
@@ -638,4 +681,133 @@ int ebt_guard_exists(const struct config *c)
 
 	args_start(&a, "-L", EBT_GUARD_CHAIN);
 	return run(c, a.a, list_buf, sizeof(list_buf)) == 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* frame types: chain EBT_FT_CHAIN in the filter table, jumped to from
+ * FORWARD only, so the station's own traffic (INPUT) is never touched.
+ * Installed, checked and removed together with the broute rules. */
+
+static const char *const ft_names[] = { "any", "untagged-only", "vlan-only" };
+
+const char *ebt_frame_types_str(int ft)
+{
+	return ft >= 0 && ft <= FT_VLAN ? ft_names[ft] : "?";
+}
+
+static int port_ft(const struct config *c, int i)
+{
+	return c->br[c->port[i].bridge].frame_types;
+}
+
+static int ft_rules(const struct config *c)
+{
+	int i, n = 0;
+
+	for (i = 0; i < c->nport; i++)
+		n += port_ft(c, i) != FT_ANY;
+	return n;
+}
+
+static void ft_rule(struct args *a, const struct config *c, int i)
+{
+	args_start(a, "-A", EBT_FT_CHAIN);
+	arg(a, "-i");
+	arg(a, c->port[i].name);
+	arg(a, "-p");
+	if (port_ft(c, i) == FT_VLAN)
+		arg(a, "!");
+	arg(a, "802_1Q");
+	arg(a, "-j");
+	arg(a, "DROP");
+}
+
+static int ft_install(const struct config *c)
+{
+	struct args a;
+	int rc, i;
+
+	if (!ft_rules(c)) {
+		if (jumps(c, "filter", "FORWARD", EBT_FT_CHAIN) != 0)
+			ft_remove(c);	/* frame_types changed back to any */
+		return 0;
+	}
+	args_start(&a, "-N", EBT_FT_CHAIN);
+	arg(&a, "-P");
+	arg(&a, "RETURN");
+	run_args(c, &a);
+	args_start(&a, "-P", EBT_FT_CHAIN);
+	arg(&a, "RETURN");
+	if ((rc = run_args(c, &a)) != 0)
+		return rc;
+	args_start(&a, "-F", EBT_FT_CHAIN);
+	if ((rc = run_args(c, &a)) != 0)
+		return rc;
+	for (i = 0; i < c->nport; i++) {
+		if (port_ft(c, i) == FT_ANY)
+			continue;
+		ft_rule(&a, c, i);
+		if ((rc = run_args(c, &a)) != 0)
+			return rc;
+		LOGI("frame types %s on %s", ebt_frame_types_str(port_ft(c, i)),
+		     c->port[i].name);
+	}
+	rc = jumps(c, "filter", "FORWARD", EBT_FT_CHAIN);
+	while (rc > 1) {
+		args_start(&a, "-D", "FORWARD");
+		arg(&a, "-j");
+		arg(&a, EBT_FT_CHAIN);
+		if ((rc = run_args(c, &a)) != 0)
+			return rc;
+		rc = jumps(c, "filter", "FORWARD", EBT_FT_CHAIN);
+	}
+	if (rc < 0)
+		return rc;
+	if (rc == 0) {
+		args_start(&a, "-I", "FORWARD");
+		arg(&a, "1");
+		arg(&a, "-j");
+		arg(&a, EBT_FT_CHAIN);
+		if ((rc = run_args(c, &a)) != 0)
+			return rc;
+	}
+	return 0;
+}
+
+static int ft_check(const struct config *c)
+{
+	struct args a;
+	char want[48];
+	int rc = jumps(c, "filter", "FORWARD", EBT_FT_CHAIN);
+
+	if (rc < 0)
+		return -1;
+	if (!ft_rules(c))
+		return rc == 0;
+	if (rc != 1)
+		return 0;
+	args_start(&a, "-L", EBT_FT_CHAIN);
+	if (run(c, a.a, list_buf, sizeof(list_buf)) != 0)
+		return 0;
+	snprintf(want, sizeof(want), "entries: %d, policy: RETURN",
+		 ft_rules(c));
+	return strstr(list_buf, want) != NULL;
+}
+
+static void ft_remove(const struct config *c)
+{
+	struct args a;
+	int i;
+
+	for (i = 0; i < 8; i++) {
+		args_start(&a, "-D", "FORWARD");
+		arg(&a, "-j");
+		arg(&a, EBT_FT_CHAIN);
+		if (run_args(c, &a) != 0)
+			break;
+	}
+	args_start(&a, "-F", EBT_FT_CHAIN);
+	run_args(c, &a);
+	args_start(&a, "-X", EBT_FT_CHAIN);
+	run_args(c, &a);
 }

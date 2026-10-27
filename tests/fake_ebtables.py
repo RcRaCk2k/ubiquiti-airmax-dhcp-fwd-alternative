@@ -43,7 +43,10 @@ def nft_rule(spec):
     while i < len(spec):
         a = spec[i]
         v = spec[i + 1] if i + 1 < len(spec) else None
-        if a == "-p":
+        if a == "-p" and v == "!":
+            out.append("ether type != " + PROTO[spec[i + 2]])
+            i += 1
+        elif a == "-p":
             out.append("ether type " + PROTO[v])
         elif a == "--vlan-encap":
             out.append("vlan type " + PROTO[v])

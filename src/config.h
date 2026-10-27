@@ -17,6 +17,7 @@
 #define DEFAULT_LEASEFILE	"/var/run/dhcp-snooping-82.leases"
 #define EBT_CHAIN		"DHCP_SNOOPING_82"
 #define EBT_GUARD_CHAIN		"DHCP_SNOOPING_82_SG"
+#define EBT_FT_CHAIN		"DHCP_SNOOPING_82_FT"
 
 #define MAX_BRIDGES		4
 #define MAX_PORTS		16
@@ -24,10 +25,14 @@
 enum { POL_FORWARD = 0, POL_DROP };
 enum { LOG_LVL_ERR = 0, LOG_LVL_WARN, LOG_LVL_INFO, LOG_LVL_DEBUG };
 enum { ROLE_NONE = 0, ROLE_CLIENT, ROLE_UPLINK };
+/* frames the bridge forwards between our ports */
+enum { FT_ANY = 0, FT_UNTAGGED, FT_VLAN };
 
 struct bridge {
 	char		name[IFNAMSIZ];
 	uint8_t		mac[6];
+	int		frame_types;	/* FT_*, from the comment or the default */
+	int		by_comment;	/* enabled by dhcp-option-82=yes */
 };
 
 /* port given explicitly (--untrusted/--trusted, [interface] untrusted/trusted) */
@@ -63,6 +68,7 @@ struct config {
 	char		circuit_id[256];
 	char		remote_id[256];
 	size_t		mtu;
+	int		frame_types;	/* FT_*, default for every bridge */
 	unsigned	type_mask;
 
 	/* filled in by config_resolve() */
@@ -122,6 +128,8 @@ void config_defaults(struct config *c);
 /* returns 0, or -1 with message in err */
 int config_load(struct config *c, const char *path, char *err, size_t errlen);
 /* detects bridges and ports, expands the ids; 0 or -1 with err */
+/* config_resolve: no bridge is enabled (yet), e.g. relay or comment off */
+#define CONFIG_NO_BRIDGE	(-2)
 int config_resolve(struct config *c, char *err, size_t errlen);
 /* sets one option, name is "section.key"; 0 or -1 with message in err */
 int config_set(struct config *c, const char *name, const char *val,

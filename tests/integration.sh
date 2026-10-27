@@ -510,6 +510,74 @@ expect "$(crossed udp4 10.0.0.100 "$W/p8i.log")" 1 "traffic passes (fail open)"
 stop_agent
 unset DS82_EBT_REJECT
 
+echo "8f) no ebt_arp (airOS 6): IPv4 bound, ARP not filtered"
+rm -f "$W/leases"
+export DS82_EBT_REJECT=--arp-ip-src
+start_agent $SG
+wait_log "source guard rules installed"
+expect "$(count 'ARP is not filtered' "$W/agent.log")" 1 "missing ARP match reported"
+expect "$(count '0 bindings, 14 rules' "$W/agent.log")" 1 "port rules without ARP"
+ins $SIM server s0.1284 "$W/server8f.log" 5 &
+SRV=$!
+sleep 0.5
+inc $SIM client c0 full > /dev/null
+wait $SRV
+wait_log "sg-bind eth0 02:11:22:33:44:55 10.0.0.100"
+sleep 0.5
+sg_probe "$W/p8j.log" <<EOP
+udp4 10.0.0.100
+udp4 10.0.0.101
+arp 10.0.0.101
+EOP
+expect "$(crossed udp4 10.0.0.100 "$W/p8j.log")" 1 "leased address passes"
+expect "$(crossed udp4 10.0.0.101 "$W/p8j.log")" 0 "other address blocked"
+expect "$(crossed arp 10.0.0.101 "$W/p8j.log")" 1 "ARP passes unchecked"
+stop_agent
+start_agent $SG source_guard.block_ip_only=no
+wait_log "source guard rules installed"
+sg_probe "$W/p8k.log" <<EOP
+arp 10.0.0.100
+pppoe -
+EOP
+expect "$(crossed arp 10.0.0.100 "$W/p8k.log")" 1 "block_ip_only=no: ARP still passes"
+expect "$(crossed pppoe - "$W/p8k.log")" 0 "and PPPoE is blocked"
+stop_agent
+unset DS82_EBT_REJECT
+
+# --- 9: frame types --------------------------------------------------
+ft_chain() {
+	python3 -I -c 'import json,sys; print(int("DHCP_SNOOPING_82_FT" in json.load(open(sys.argv[1]))["chains"]))' "$W/ebt_state.json"
+}
+PORTS="-u br1:eth0,br1:eth1 -t br1:ath0.1284"
+echo "9) frame_types: VLAN tagged or untagged frames not bridged"
+start_agent $PORTS
+wait_log "broute rules installed"
+expect "$(ft_chain)" 0 "any (default): no frame type chain"
+stop_agent
+start_agent $PORTS interface.frame_types=untagged-only
+wait_log "broute rules installed"
+expect "$(count 'frame types untagged-only on ' "$W/agent.log")" 3 "untagged-only: one rule per port"
+sg_probe "$W/p9a.log" <<EOP
+udp4 10.0.0.100
+vlan4 10.0.0.100
+EOP
+expect "$(crossed udp4 10.0.0.100 "$W/p9a.log")" 1 "untagged frame passes"
+expect "$(crossed vlan4 10.0.0.100 "$W/p9a.log")" 0 "VLAN tagged frame dropped"
+stop_agent
+expect "$(ft_chain)" 0 "agent stopped: chain removed"
+export DS82_BROUTE_RULES=0
+start_agent $PORTS interface.frame_types=vlan-only
+wait_log "broute rules installed"
+expect "$(count 'broute rules installed (chain DHCP_SNOOPING_82, 0 rules)' "$W/agent.log")" 1 "vlan-only: no DHCP diverted"
+sg_probe "$W/p9b.log" <<EOP
+udp4 10.0.0.100
+vlan4 10.0.0.100
+EOP
+expect "$(crossed udp4 10.0.0.100 "$W/p9b.log")" 0 "untagged frame dropped"
+expect "$(crossed vlan4 10.0.0.100 "$W/p9b.log")" 1 "VLAN tagged frame passes"
+stop_agent
+unset DS82_BROUTE_RULES
+
 # --- 4: rules present but agent dead: fail closed -------------------
 echo "4) agent stopped, rules kept: DHCP blocked (fail closed)"
 ins $SIM sniff s0.1284 "$W/server4.log" 3 &
@@ -548,6 +616,38 @@ stop_agent
 expect "$(count '"kind": "dhcp6"' "$W/server5v6.log")" 1 "exactly one SOLICIT on uplink, unrelayed"
 expect "$(grep -c '"op": 1' "$W/server5.log" || true)" 1 "exactly one DISCOVER on uplink"
 expect "$(grep '"op": 1' "$W/server5.log" | grep -c '"o82": null' || true)" 1 "and it is the unmodified original"
+
+echo "5b) airOS 6: bridge comment instead of the relay switch, Apply without restart"
+syscfg() {	# new system.cfg as airOS writes it, comment of br1 as $1
+	cat > "$W/system.cfg.new" <<EOF
+resolv.host.1.name=cust-example
+dhcprelay.status=disabled
+bridge.1.devname=br1
+bridge.1.comment=$1
+EOF
+	mv "$W/system.cfg.new" "$W/system.cfg"
+}
+cp "$W/system.cfg" "$W/system.cfg.orig"
+syscfg "Kunde X; dhcp-option-82=yes frame-types=untagged-only"
+start_agent
+wait_log "broute rules installed"
+expect "$(count 'frame types untagged-only on ' "$W/agent.log")" 3 "enabled by comment, frame-types from it"
+expect "$(ft_chain)" 1 "frame type chain installed"
+syscfg "Kunde X"
+wait_log "no bridge enabled: rules removed"
+expect "$(count 'no bridge enabled: rules removed' "$W/agent.log")" 1 "comment removed: agent notices the changed file"
+expect "$(ft_chain)" 0 "and removes its rules"
+expect "$(kill -0 "$AGENT" 2>/dev/null && echo 1 || echo 0)" 1 "but keeps running, init would respawn it"
+syscfg "dhcp-option-82=yes Kunde X"
+wait_log "bridge enabled again, resuming"
+i=0
+while [ "$(count 'worker: client eth0' "$W/agent.log")" -lt 2 ] && [ $i -lt 50 ]; do
+	sleep 0.1; i=$((i + 1))
+done
+expect "$(count 'bridge enabled again, resuming' "$W/agent.log")" 1 "comment back: resumed"
+expect "$(count 'worker: client eth0' "$W/agent.log")" 2 "with a new worker"
+stop_agent
+mv "$W/system.cfg.orig" "$W/system.cfg"
 
 [ "$fail" = 0 ] && echo "integration: PASS" || echo "integration: FAIL"
 exit $fail

@@ -1,14 +1,17 @@
 # dhcp-snooping-82
 
 Transparent DHCPv4 option 82 agent (RFC 3046) and DHCPv6 lightweight relay
-agent (RFC 6221) for Ubiquiti airOS 8 (PowerBeam 5AC, WA.v8.7.11). It replaces
+agent (RFC 6221) for Ubiquiti airOS 8 (PowerBeam 5AC, WA.v8.7.11) and airOS 6
+(XW.v6.3.26). It replaces
 `/bin/dhcp-fwd` and adds option 82 exactly once to every DHCP client packet
 that physically arrives on a customer port, including unicast renews. Apart
 from that the bridge is left unchanged. It is not an L3 relay: `giaddr` stays
 0, the upstream relay sets it.
 
 * **Bridges:** all bridges with the DHCP relay enabled in `/tmp/system.cfg`
-  (`dhcprelay.client.N.devname`), or the ports given with `-u`/`-t`.
+  (`dhcprelay.client.N.devname`) or the word `dhcp-option-82=yes` in their
+  comment (see [Bridge comment](#bridge-comment)), or the ports given with
+  `-u`/`-t`.
 * **Ports:** each bridge member is classified by the physical interface below
   any VLANs: `eth*` = untrusted customer port, `ath*` = trusted uplink. This
   covers `eth0`, `eth0.100`, `ath0`, `ath0.1284` and several Ethernet ports.
@@ -77,6 +80,15 @@ dhcp-fwd -n -u br1:eth0,br1:eth1 -t br1:ath0 -u br2:eth0.100 -t br2:ath0.200 \
 Templates: `%h` hostname (`resolv.host.1.name`), `%b` bridge, `%p` port,
 `%m` bridge MAC, `%M` port MAC (MACs as 12 hex digits), `%%` percent sign.
 
+`interface.frame_types=any|untagged-only|vlan-only` limits what the bridge
+forwards between the agent's ports (default `any`). `untagged-only` drops
+VLAN tagged frames, e.g. a foreign VLAN leaking over a link that is meant to
+be a plain untagged transparent bridge; `vlan-only` drops untagged frames,
+and the agent then handles no DHCP. The rules sit in the chain
+`DHCP_SNOOPING_82_FT` of the filter table, jumped to from `FORWARD` only:
+the station's own traffic, e.g. a management VLAN, is not affected. They are
+installed, checked and removed together with the broute rules.
+
 IPv6 options (all default on):
 
 | Option | Meaning |
@@ -126,6 +138,10 @@ the DHCP server handed out can be used (IP source guard plus ARP inspection):
   `0.0.0.0`, IPv6 link-local sources and `::` for duplicate address detection.
   VLAN tagged IPv4/ARP/IPv6 from a customer port is dropped so it cannot
   bypass the rules.
+* **airOS 6** (XW.v6.3.26) has the same kernel but no `ebt_arp` module. The
+  agent detects that at start: IPv4 and IPv6 are bound as usual, ARP passes
+  unchecked (logged as a warning, `--status` shows `source_guard_arp not
+  filtered`).
 * **Restart:** the binding table is written to the lease file on every change
   (RAM, no flash wear), so a restarted agent (e.g. after "Apply") restores
   it. After a reboot the file is gone; the customer's router normally asks
@@ -198,6 +214,37 @@ blocks `ensure` until the next reboot). Remove: `dhcp-snooping-82.sh uninstall -
 
 The "DHCP Relay" switch in the airOS web UI still turns the agent on and off,
 because init keeps starting `/bin/dhcp-fwd`.
+
+### Bridge comment
+
+The airOS 6 web UI has no DHCP relay switch for a bridge, so its comment
+field (Network, bridge, "Comment") controls the agent instead. Words of the
+form `key=value` count anywhere in the comment, separated by blanks, commas or
+semicolons; keys and values ignore case and the rest of the comment is free
+text, e.g. `Kunde X; dhcp-option-82=yes frame-types=untagged-only`.
+
+| Word | Meaning |
+|---|---|
+| `dhcp-option-82=yes\|no` | `yes`: the agent handles this bridge; `no`: it does not, even with the airOS relay enabled |
+| `frame-types=any\|untagged-only\|vlan-only` | overrides `interface.frame_types` for this bridge |
+
+Without the airOS relay, airOS writes no `dhcp-fwd` line to `/etc/inittab`.
+`dhcp-snooping-82.sh ensure` (boot hook, see below) adds that line, the
+same one airOS writes for the relay, when a comment has
+`dhcp-option-82=yes`, and removes it and stops the agent when no comment has
+it any more. This needs CS firmware for the boot hook; with standard
+firmware call `ensure` over SSH.
+
+"Apply" of a small change such as the comment restarts nothing on airOS 6
+("fastrestart": `ubntconf -p`, no `rc start`, no boot hook). The agent
+therefore reloads by itself when `/tmp/system.cfg` changes: a new
+`frame-types` takes effect, and without any enabled bridge it removes its
+rules and waits (it keeps running, so init does not respawn it in a loop)
+until a comment or the relay enables one again. A full softrestart rebuilds
+`/etc/inittab` and runs the boot hook, which adds the line again.
+
+Note: "Apply" also writes `/etc/persistent` to flash, so after an Apply an
+`install` without `--save` is saved too.
 
 Update: copy the new files to `/tmp`, run `sh /tmp/dhcp-snooping-82.sh install`,
 then `dhcp-snooping-82.sh activate` (mounts the new binary and restarts the agent;

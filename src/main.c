@@ -1365,22 +1365,55 @@ static int load_config(struct config *c, char *err, size_t errlen)
 	return 0;
 }
 
+/* 0, -1 (old config kept) or CONFIG_NO_BRIDGE (auto detection found no
+ * enabled bridge any more: the caller drops the rules) */
 static int reload_config(void)
 {
 	struct config n;
 	char err[256];
+	int r;
 
 	if (load_config(&n, err, sizeof(err)) < 0) {
 		LOGE("reload: %s (keeping old config)", err);
 		return -1;
 	}
-	if (config_resolve(&n, err, sizeof(err)) < 0) {
+	r = config_resolve(&n, err, sizeof(err));
+	if (r == CONFIG_NO_BRIDGE && !n.nxport) {
+		LOGW("reload: %s", err);
+		return r;
+	}
+	if (r < 0) {
 		LOGE("reload: %s (keeping old config)", err);
 		return -1;
 	}
 	cfg = n;
 	log_set_level(cfg.log_level);
 	return 0;
+}
+
+/* airOS 6 applies small changes such as a bridge comment without
+ * restarting anything ("ubntconf -p"), so a changed system.cfg counts as
+ * SIGHUP; it must be 2 s old so it is not read while being written */
+static int syscfg_changed(void)
+{
+	static struct stat seen;
+	static int have;
+	struct stat sb;
+
+	if (stat(cfg.system_cfg, &sb) < 0)
+		return 0;
+	if (!have) {	/* first call: before the configuration is read */
+		seen = sb;
+		have = 1;
+		return 0;
+	}
+	if (sb.st_mtime == seen.st_mtime && sb.st_size == seen.st_size &&
+	    sb.st_ino == seen.st_ino)
+		return 0;
+	if (time(NULL) - sb.st_mtime < 2)
+		return 0;
+	seen = sb;
+	return 1;
 }
 
 static pid_t start_worker(unsigned restarts)
@@ -1407,7 +1440,7 @@ static int watcher(void)
 	pid_t child = -1;
 	unsigned restarts = 0, backoff = 1;
 	time_t t_check = 0, t_start = 0, now;
-	int rules_ok = 0;
+	int rules_ok = 0, idle = 0, reloading = 0;
 
 	if (ebt_install(&cfg) == 0)
 		rules_ok = 1;
@@ -1429,7 +1462,7 @@ static int watcher(void)
 		struct pollfd gp = { guard_pipe[0], POLLIN, 0 };
 
 		now = mono();
-		if (child < 0 && now >= t_start) {
+		if (child < 0 && !idle && now >= t_start) {
 			child = start_worker(restarts);
 			t_start = now;
 		}
@@ -1438,7 +1471,8 @@ static int watcher(void)
 			guard_read(mono());
 		if (sig_stop)
 			break;
-		guard_tick(mono());
+		if (!idle)
+			guard_tick(mono());
 		sig_chld = 0;
 		if (child > 0) {
 			int status;
@@ -1450,6 +1484,12 @@ static int watcher(void)
 				if (code == EXIT_ROLLBACK) {
 					run_rollback();
 					break;
+				}
+				if (reloading) {
+					/* stopped by us for the new configuration */
+					reloading = 0;
+					t_start = mono();
+					continue;
 				}
 				restarts++;
 				if (mono() - t_start > 60)
@@ -1463,13 +1503,41 @@ static int watcher(void)
 				/* rules stay in place: fail closed */
 			}
 		}
+		if (syscfg_changed()) {
+			LOGI("%s changed", cfg.system_cfg);
+			sig_hup = 1;
+		}
 		if (sig_hup) {
+			int r;
+
 			sig_hup = 0;
 			LOGI("SIGHUP: reloading configuration");
-			if (reload_config() == 0) {
-				rules_ok = ebt_install(&cfg) == 0;
-				if (child > 0)
+			r = reload_config();
+			if (r == CONFIG_NO_BRIDGE && !idle) {
+				/* e.g. dhcp-option-82=yes removed from the comment */
+				if (child > 0) {
 					kill(child, SIGTERM);
+					waitpid(child, NULL, 0);
+					child = -1;
+				}
+				ebt_remove(&cfg);
+				if (guard_active)
+					ebt_guard_remove(&cfg);
+				guard_active = guard_started = 0;
+				rules_ok = 0;
+				idle = 1;
+				LOGI("no bridge enabled: rules removed, waiting");
+			}
+			if (r == 0) {
+				if (idle)
+					LOGI("bridge enabled again, resuming");
+				idle = 0;
+				t_start = mono();
+				rules_ok = ebt_install(&cfg) == 0;
+				if (child > 0) {
+					kill(child, SIGTERM);
+					reloading = 1;
+				}
 				guard_why = "port no longer a client port";
 				if (!cfg.sg_enable) {
 					if (guard_active)
@@ -1490,7 +1558,7 @@ static int watcher(void)
 			}
 		}
 		now = mono();
-		if (now - t_check >= (time_t)cfg.rule_check_interval) {
+		if (!idle && now - t_check >= (time_t)cfg.rule_check_interval) {
 			int r = ebt_check(&cfg);
 
 			t_check = now;
@@ -1693,10 +1761,13 @@ static void print_config(void)
 	printf("circuit_id      %s\n", cfg.circuit_id);
 	printf("remote_id       %s\n", cfg.remote_id);
 	for (i = 0; i < cfg.nbr; i++)
-		printf("bridge          %s mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+		printf("bridge          %s mac=%02x:%02x:%02x:%02x:%02x:%02x "
+		       "frame_types=%s%s\n",
 		       cfg.br[i].name, cfg.br[i].mac[0], cfg.br[i].mac[1],
 		       cfg.br[i].mac[2], cfg.br[i].mac[3], cfg.br[i].mac[4],
-		       cfg.br[i].mac[5]);
+		       cfg.br[i].mac[5],
+		       ebt_frame_types_str(cfg.br[i].frame_types),
+		       cfg.br[i].by_comment ? " (enabled by comment)" : "");
 	for (i = 0; i < cfg.nport; i++) {
 		const struct port *p = &cfg.port[i];
 
@@ -1717,6 +1788,7 @@ static void print_config(void)
 	}
 	printf("type_mask       0x%x\n", cfg.type_mask);
 	printf("mtu             %u\n", (unsigned)cfg.mtu);
+	printf("frame_types     %s\n", ebt_frame_types_str(cfg.frame_types));
 	printf("existing_o82    %s\n", cfg.existing_o82 ? "drop" : "forward");
 	printf("reply_foreign   %s\n", cfg.reply_foreign ? "drop" : "forward");
 	printf("reply_no_o82    %s\n", cfg.reply_no_o82 ? "drop" : "forward");
@@ -1775,6 +1847,8 @@ static int status(void)
 		printf("source_guard_rules %s (counters: ebtables -t filter -L %s "
 		       "--Lc)\n", g == 1 ? "ok" : g == 0 ?
 		       "missing or grace period" : "error", EBT_GUARD_CHAIN);
+		if (!ebt_guard_arp(&cfg))
+			printf("source_guard_arp not filtered (no ebt_arp)\n");
 		for (i = 0; i < t.nra; i++) {
 			char a[48];
 
@@ -1921,6 +1995,7 @@ int main(int argc, char **argv)
 		cfg.log_level = LOG_LVL_DEBUG;
 	log_init(cfg.log_level, debug || mode);
 	set_signals();
+	syscfg_changed();
 	if (config_resolve(&cfg, err, sizeof(err)) < 0) {
 		LOGE("%s", err);
 		if (mode)

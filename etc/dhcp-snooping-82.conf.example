@@ -18,7 +18,9 @@
 #
 # Without explicit ports:
 # Bridges: "auto" = every bridge with DHCP relay (option 82) enabled in
-# /tmp/system.cfg (dhcprelay.client.N.devname), or a list like "br1, br2".
+# /tmp/system.cfg (dhcprelay.client.N.devname) or with the word
+# "dhcp-option-82=yes" in its comment (bridge.N.comment, "=no" excludes it),
+# or a list like "br1, br2".
 bridges = auto
 # Ports of those bridges are classified by the physical device below any
 # VLAN (ath0.1284 -> ath0): eth* = untrusted client port, ath* = uplink.
@@ -28,6 +30,12 @@ uplinks = auto
 client_prefix = eth
 uplink_prefix = ath
 mtu = 1500               # max IP length after inserting option 82
+# Frames the bridge forwards between these ports (the station's own
+# traffic is not affected): any, untagged-only (drop VLAN tagged frames,
+# e.g. foreign VLANs leaking over a plain untagged link), vlan-only (drop
+# untagged frames; the agent then handles no DHCP at all). The word
+# "frame-types=..." in a bridge comment overrides this for that bridge.
+frame_types = any
 
 [option82]
 # %h hostname (resolv.host.1.name), %b bridge, %p port,
