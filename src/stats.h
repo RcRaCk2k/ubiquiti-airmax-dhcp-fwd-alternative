@@ -54,6 +54,7 @@
 	X(icmp6_ratelimited)						\
 	X(guard_msgs)		/* source guard: bindings to the watcher */ \
 	X(guard_msgs_lost)	/* pipe full */				\
+	X(guard_ra)		/* RAs with SLAAC prefixes on uplinks */	\
 	X(tx_uplink)							\
 	X(tx_client)							\
 	X(tx_error)

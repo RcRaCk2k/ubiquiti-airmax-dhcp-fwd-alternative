@@ -86,6 +86,10 @@ grace = 0
 # lease beyond the limit replaces the binding renewed longest ago.
 max_bindings = 16
 lease_file = /var/run/dhcp-snooping-82.leases   # RAM, survives agent restarts
+# SLAAC addresses in the prefixes the uplink router announces (A flag), for
+# clients with a DHCP binding: eui64 = only the address formed from the MAC,
+# prefix = the whole /64 (privacy addresses), no = none
+slaac = eui64
 
 [forwarding]
 rate_limit = 20          # DHCP frames/s per port, 0 = unlimited

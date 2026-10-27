@@ -421,6 +421,25 @@ expect "$(crossed udp6 2001:db8:100:ff::1 "$W/p8c.log")" 1 "anywhere in the /56"
 expect "$(crossed udp6 2001:db8:200::1 "$W/p8c.log")" 0 "outside the prefix blocked"
 expect "$(crossed udp6 2001:db8:100::1 "$W/p8c.log" 02deadbeef01)" 0 "prefix from another MAC blocked"
 
+# SLAAC: the uplink router's prefix gives the client its EUI-64 address
+SLAAC=2001:db8:0:1270:11:22ff:fe33:4455
+ins $SIM send6 s0.1284 uplink-ra-slaac
+wait_log "sg-bind eth0 02:11:22:33:44:55 $SLAAC slaac"
+sleep 0.5
+expect "$(count 'SLAAC prefix 2001:db8:0:1270::/64 on ath0.1284 learned' "$W/agent.log")" 1 "SLAAC prefix learned from the uplink RA"
+expect "$(grep -c '^ra ath0.1284 2001:db8:0:1270::/64 ' "$W/leases")" 1 "prefix in the lease file"
+ins $SIM send6 s0.1284 uplink-ra-slaac
+sleep 0.5
+expect "$(count 'sg-bind eth0 02:11:22:33:44:55 2001:db8:0:1270' "$W/agent.log")" 1 "repeated RA adds no rule"
+sg_probe "$W/p8s.log" <<EOP
+udp6 $SLAAC
+udp6 2001:db8:0:1270::99
+udp6 $SLAAC 02:de:ad:be:ef:01
+EOP
+expect "$(crossed udp6 $SLAAC "$W/p8s.log")" 1 "EUI-64 SLAAC address passes"
+expect "$(crossed udp6 2001:db8:0:1270::99 "$W/p8s.log")" 0 "other address in the SLAAC prefix blocked"
+expect "$(crossed udp6 $SLAAC "$W/p8s.log" 02deadbeef01)" 0 "SLAAC address from another MAC blocked"
+
 : > "$W/ebt.log"
 inc $SIM send c0 release
 wait_log "sg-unbind eth0 02:11:22:33:44:55 10.0.0.100 (released)"
@@ -442,9 +461,11 @@ wait_log "source guard rules installed"
 expect "$(count 'source guard: 1 bindings from' "$W/agent.log")" 1 "one binding restored"
 sg_probe "$W/p8e.log" <<EOP
 udp6 2001:db8:100::1
+udp6 $SLAAC
 udp4 10.0.0.100
 EOP
 expect "$(crossed udp6 2001:db8:100::1 "$W/p8e.log")" 1 "restored prefix passes"
+expect "$(crossed udp6 $SLAAC "$W/p8e.log")" 1 "SLAAC address restored with the prefix"
 expect "$(crossed udp4 10.0.0.100 "$W/p8e.log")" 0 "released address still blocked"
 stop_agent
 

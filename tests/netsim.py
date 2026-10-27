@@ -434,6 +434,15 @@ def send6(iface, kind):
         c = l4csum6(src, ALL_NODES, 58, ra)
         ra = ra[:2] + struct.pack("!H", c) + ra[4:]
         f = frame6(MCAST_NODES_MAC, SERVER_MAC, src, ALL_NODES, 58, ra)
+    elif kind == "uplink-ra-slaac":
+        # the operator's router: SLAAC prefix 2001:db8:0:1270::/64
+        src = link_local(SERVER_MAC)
+        pio = struct.pack("!BBBBIII", 3, 4, 64, 0xc0, 1800, 900, 0) + \
+            bytes.fromhex("20010db800001270") + b"\0" * 8
+        ra = bytes([134, 0, 0, 0, 64, 0]) + struct.pack("!HII", 1800, 0, 0) + pio
+        c = l4csum6(src, ALL_NODES, 58, ra)
+        ra = ra[:2] + struct.pack("!H", c) + ra[4:]
+        f = frame6(MCAST_NODES_MAC, SERVER_MAC, src, ALL_NODES, 58, ra)
     elif kind == "rogue-advertise":
         # DHCPv6 server behind the customer port
         f = udp6(MCAST_RELAYS_MAC, CLIENT_MAC, link_local(CLIENT_MAC),

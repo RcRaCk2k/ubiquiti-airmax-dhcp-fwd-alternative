@@ -24,10 +24,11 @@ static int same_addr(const struct binding *b, int v6, const uint8_t *addr,
 }
 
 /* limits count IPv4 addresses, IPv6 addresses (IA_NA/IA_TA) and delegated
- * prefixes (IA_PD) separately, so one stack never crowds out the other */
-static int kind(int v6, unsigned plen)
+ * prefixes (IA_PD) separately, so one stack never crowds out the other;
+ * SLAAC bindings are bounded by the DHCP ones they follow */
+static int kind(int v6, unsigned plen, int slaac)
 {
-	return !v6 ? 0 : plen == 128 ? 1 : 2;
+	return slaac ? 3 : !v6 ? 0 : plen == 128 ? 1 : 2;
 }
 
 static void remove_at(struct guard_tab *t, int i, const struct guard_ops *ops)
@@ -77,8 +78,8 @@ static int forget(struct guard_tab *t, const struct guard_msg *m,
 	for (i = t->n - 1; i >= 0; i--) {
 		const struct binding *b = &t->b[i];
 
-		if (strcmp(b->port, m->port) || memcmp(b->mac, m->mac, 6) ||
-		    b->v6 != m->v6)
+		if (b->slaac || strcmp(b->port, m->port) ||
+		    memcmp(b->mac, m->mac, 6) || b->v6 != m->v6)
 			continue;
 		if (m->op == GUARD_FORGET_MAC || same_addr(b, m->v6, addr, m->plen)) {
 			remove_at(t, i, ops);
@@ -97,6 +98,8 @@ int guard_apply(struct guard_tab *t, const struct guard_msg *m, time_t now,
 	unsigned on_port = 0;
 	int i, oldest = -1;
 
+	if (m->op == GUARD_RA)
+		return GUARD_INVALID;	/* guard_ra() */
 	if (m->op == GUARD_FORGET_MAC)
 		return m->v6 ? GUARD_INVALID : forget(t, m, addr, ops);
 	if (!usable(m, addr))
@@ -110,7 +113,8 @@ int guard_apply(struct guard_tab *t, const struct guard_msg *m, time_t now,
 		  now + (time_t)m->lifetime + GUARD_SLACK;
 	for (i = 0; i < t->n; i++) {
 		b = &t->b[i];
-		if (!strcmp(b->port, m->port) && !memcmp(b->mac, m->mac, 6) &&
+		if (!b->slaac && !strcmp(b->port, m->port) &&
+		    !memcmp(b->mac, m->mac, 6) &&
 		    same_addr(b, m->v6, addr, m->plen)) {
 			if (b->expires == expires)
 				return GUARD_NOCHANGE;
@@ -120,6 +124,8 @@ int guard_apply(struct guard_tab *t, const struct guard_msg *m, time_t now,
 	}
 	for (i = t->n - 1; i >= 0; i--) {
 		b = &t->b[i];
+		if (b->slaac)
+			continue;
 		/* the address moved to another client or port, or (IPv4) the
 		 * client got a new address: the old binding is void */
 		if (same_addr(b, m->v6, addr, m->plen) ||
@@ -131,7 +137,7 @@ int guard_apply(struct guard_tab *t, const struct guard_msg *m, time_t now,
 	for (i = 0; i < t->n; i++) {
 		b = &t->b[i];
 		if (strcmp(b->port, m->port) ||
-		    kind(b->v6, b->plen) != kind(m->v6, m->plen))
+		    kind(b->v6, b->plen, b->slaac) != kind(m->v6, m->plen, 0))
 			continue;
 		on_port++;
 		/* the one renewed longest ago, "never" last */
@@ -159,10 +165,163 @@ int guard_apply(struct guard_tab *t, const struct guard_msg *m, time_t now,
 	return GUARD_CHANGED;
 }
 
+int guard_ra(struct guard_tab *t, const struct guard_msg *m, time_t now)
+{
+	time_t expires;
+	struct ra_prefix *r;
+	int i;
+
+	if (m->op != GUARD_RA || !m->v6 || m->plen != 64 ||
+	    m->addr[0] == 0xff || (m->addr[0] == 0xfe && (m->addr[1] & 0xc0) == 0x80) ||
+	    !memcmp(m->addr, "\0\0\0\0\0\0\0\0", 8))
+		return GUARD_INVALID;
+	expires = m->lifetime == GUARD_INFINITE ? 0 :
+		  now + (time_t)m->lifetime + GUARD_SLACK;
+	for (i = 0; i < t->nra; i++) {
+		r = &t->ra[i];
+		if (strcmp(r->port, m->port) || memcmp(r->prefix, m->addr, 8))
+			continue;
+		if (!m->lifetime) {
+			t->ra[i] = t->ra[--t->nra];
+			return GUARD_CHANGED;
+		}
+		if (r->expires == expires)
+			return GUARD_NOCHANGE;
+		r->expires = expires;
+		return GUARD_RENEWED;
+	}
+	if (!m->lifetime)
+		return GUARD_NOCHANGE;
+	if (t->nra >= GUARD_MAX_RA)
+		return GUARD_FULL;
+	r = &t->ra[t->nra++];
+	memset(r, 0, sizeof(*r));
+	memcpy(r->port, m->port, sizeof(r->port));
+	r->port[sizeof(r->port) - 1] = '\0';
+	memcpy(r->prefix, m->addr, 8);
+	r->expires = expires;
+	return GUARD_CHANGED;
+}
+
+/* the SLAAC address (or /64) of mac in prefix r */
+static void slaac_addr(const struct ra_prefix *r, const uint8_t *mac, int mode,
+		       uint8_t *addr, uint8_t *plen)
+{
+	memcpy(addr, r->prefix, 8);
+	memset(addr + 8, 0, 8);
+	*plen = 64;
+	if (mode != GUARD_SLAAC_EUI64)
+		return;
+	/* modified EUI-64, RFC 4291 appendix A */
+	addr[8] = mac[0] ^ 0x02;
+	addr[9] = mac[1];
+	addr[10] = mac[2];
+	addr[11] = 0xff;
+	addr[12] = 0xfe;
+	addr[13] = mac[3];
+	addr[14] = mac[4];
+	addr[15] = mac[5];
+	*plen = 128;
+}
+
+static int has_dhcp_binding(const struct guard_tab *t, const char *port,
+			    const uint8_t *mac)
+{
+	int i;
+
+	for (i = 0; i < t->n; i++)
+		if (!t->b[i].slaac && !strcmp(t->b[i].port, port) &&
+		    !memcmp(t->b[i].mac, mac, 6))
+			return 1;
+	return 0;
+}
+
+static int ra_applies(const struct ra_prefix *r, const char *port,
+		      const struct guard_ops *ops)
+{
+	return !ops || !ops->same_bridge ||
+	       ops->same_bridge(port, r->port, ops->ctx);
+}
+
+int guard_sync(struct guard_tab *t, int mode, const struct guard_ops *ops)
+{
+	uint8_t addr[16], plen;
+	int i, j, k, n0, ret = GUARD_NOCHANGE;
+
+	/* drop what no prefix and no DHCP binding backs any more */
+	for (i = t->n - 1; i >= 0; i--) {
+		struct binding *b = &t->b[i];
+		const struct ra_prefix *r = NULL;
+
+		if (!b->slaac)
+			continue;
+		for (j = 0; mode && j < t->nra && !r; j++) {
+			slaac_addr(&t->ra[j], b->mac, mode, addr, &plen);
+			if (same_addr(b, 1, addr, plen) &&
+			    ra_applies(&t->ra[j], b->port, ops))
+				r = &t->ra[j];
+		}
+		if (!r || !has_dhcp_binding(t, b->port, b->mac)) {
+			remove_at(t, i, ops);
+			ret = GUARD_CHANGED;
+		} else if (b->expires != r->expires) {
+			b->expires = r->expires;
+			if (ret == GUARD_NOCHANGE)
+				ret = GUARD_RENEWED;
+		}
+	}
+	if (!mode)
+		return ret;
+	/* every client MAC with a DHCP binding, once per port */
+	n0 = t->n;
+	for (i = 0; i < n0; i++) {
+		const struct binding *d = &t->b[i];
+
+		if (d->slaac)
+			continue;
+		for (k = 0; k < i; k++)
+			if (!t->b[k].slaac && !strcmp(t->b[k].port, d->port) &&
+			    !memcmp(t->b[k].mac, d->mac, 6))
+				break;
+		if (k < i)
+			continue;
+		for (j = 0; j < t->nra; j++) {
+			struct binding *b;
+
+			if (!ra_applies(&t->ra[j], d->port, ops))
+				continue;
+			slaac_addr(&t->ra[j], d->mac, mode, addr, &plen);
+			for (k = 0; k < t->n; k++)
+				if (!strcmp(t->b[k].port, d->port) &&
+				    !memcmp(t->b[k].mac, d->mac, 6) &&
+				    same_addr(&t->b[k], 1, addr, plen))
+					break;
+			if (k < t->n || t->n >= GUARD_MAX)
+				continue;	/* there (from DHCP too) or full */
+			b = &t->b[t->n++];
+			memset(b, 0, sizeof(*b));
+			memcpy(b->port, d->port, sizeof(b->port));
+			memcpy(b->mac, d->mac, 6);
+			b->v6 = 1;
+			b->plen = plen;
+			b->slaac = 1;
+			memcpy(b->addr, addr, 16);
+			b->expires = t->ra[j].expires;
+			ret = GUARD_CHANGED;
+			if (ops && ops->add)
+				ops->add(b, ops->ctx);
+		}
+	}
+	return ret;
+}
+
 int guard_expire(struct guard_tab *t, time_t now, const struct guard_ops *ops)
 {
 	int i, n = 0;
 
+	for (i = t->nra - 1; i >= 0; i--)
+		if (t->ra[i].expires && t->ra[i].expires <= now)
+			t->ra[i] = t->ra[--t->nra];
 	for (i = t->n - 1; i >= 0; i--)
 		if (t->b[i].expires && t->b[i].expires <= now) {
 			remove_at(t, i, ops);
@@ -283,9 +442,9 @@ const char *binding_str(const struct binding *b, char *buf)
 {
 	char a[48];
 
-	sprintf(buf, "%s %02x:%02x:%02x:%02x:%02x:%02x %s", b->port,
+	sprintf(buf, "%s %02x:%02x:%02x:%02x:%02x:%02x %s%s", b->port,
 		b->mac[0], b->mac[1], b->mac[2], b->mac[3], b->mac[4], b->mac[5],
-		binding_addr(b, a));
+		binding_addr(b, a), b->slaac ? " slaac" : "");
 	return buf;
 }
 
@@ -293,17 +452,35 @@ size_t guard_save(const struct guard_tab *t, const char *boot_id, time_t now,
 		  char *buf, size_t len)
 {
 	size_t o = 0;
-	int i, r;
+	int i, r, n = 0;
 
-	r = snprintf(buf, len, "# dhcp-snooping-82 source guard: %d bindings\n"
-		     "boot %s\n", t->n, boot_id && *boot_id ? boot_id : "-");
+	for (i = 0; i < t->n; i++)
+		n += !t->b[i].slaac;
+	r = snprintf(buf, len, "# dhcp-snooping-82 source guard: %d bindings, "
+		     "%d SLAAC prefixes\nboot %s\n", n, t->nra,
+		     boot_id && *boot_id ? boot_id : "-");
 	if (r < 0 || (size_t)r >= len)
 		return 0;
 	o = (size_t)r;
+	for (i = 0; i < t->nra; i++) {
+		const struct ra_prefix *p = &t->ra[i];
+		char a[48];
+
+		ip6_str(p->prefix, a);
+		r = p->expires ?
+		    snprintf(buf + o, len - o, "ra %s %s/64 %ld %lds\n", p->port,
+			     a, (long)p->expires, (long)(p->expires - now)) :
+		    snprintf(buf + o, len - o, "ra %s %s/64 never\n", p->port, a);
+		if (r < 0 || (size_t)r >= len - o)
+			return 0;
+		o += (size_t)r;
+	}
 	for (i = 0; i < t->n; i++) {
 		const struct binding *b = &t->b[i];
 		char s[96];
 
+		if (b->slaac)
+			continue;	/* derived again after loading */
 		r = b->expires ?
 		    snprintf(buf + o, len - o, "%s %s %ld %lds\n",
 			     b->v6 ? "v6" : "v4", binding_str(b, s),
@@ -330,10 +507,44 @@ static int parse_mac(const char *s, uint8_t *mac)
 	return 0;
 }
 
+static int parse_expiry(const char *exp, time_t now, time_t *e)
+{
+	char *end;
+	long v;
+
+	if (!strcmp(exp, "never")) {
+		*e = 0;
+		return 0;
+	}
+	v = strtol(exp, &end, 10);
+	if (*end || v <= now)
+		return -1;	/* broken or expired */
+	*e = (time_t)v;
+	return 0;
+}
+
+/* "ra ath0 2001:db8::/64 <expires>" */
+static int parse_ra(const char *line, struct ra_prefix *r, time_t now)
+{
+	char port[IFNAMSIZ], addr[64], exp[24], *slash;
+
+	if (sscanf(line, "ra %15s %63s %23s", port, addr, exp) != 3)
+		return -1;
+	memset(r, 0, sizeof(*r));
+	snprintf(r->port, sizeof(r->port), "%s", port);
+	slash = strchr(addr, '/');
+	if (!slash || strcmp(slash, "/64"))
+		return -1;
+	*slash = '\0';
+	if (inet_pton(AF_INET6, addr, r->prefix) != 1 ||
+	    memcmp(r->prefix + 8, "\0\0\0\0\0\0\0\0", 8))
+		return -1;
+	return parse_expiry(exp, now, &r->expires);
+}
+
 static int parse_line(const char *line, struct binding *b, time_t now)
 {
 	char fam[4], port[IFNAMSIZ], mac[24], addr[64], exp[24], *slash, *end;
-	long e;
 
 	if (sscanf(line, "%3s %15s %23s %63s %23s", fam, port, mac, addr,
 		   exp) != 5)
@@ -357,13 +568,7 @@ static int parse_line(const char *line, struct binding *b, time_t now)
 	}
 	if (inet_pton(b->v6 ? AF_INET6 : AF_INET, addr, b->addr) != 1)
 		return -1;
-	if (!strcmp(exp, "never"))
-		return 0;
-	e = strtol(exp, &end, 10);
-	if (*end || e <= now)
-		return -1;	/* broken or expired */
-	b->expires = (time_t)e;
-	return 0;
+	return parse_expiry(exp, now, &b->expires);
 }
 
 int guard_load(struct guard_tab *t, const char *text, const char *boot_id,
@@ -372,6 +577,7 @@ int guard_load(struct guard_tab *t, const char *text, const char *boot_id,
 	const char *line, *next;
 
 	t->n = 0;
+	t->nra = 0;
 	for (line = text; line && *line; line = next) {
 		char l[256];
 		size_t n;
@@ -388,7 +594,13 @@ int guard_load(struct guard_tab *t, const char *text, const char *boot_id,
 			/* another boot: monotonic times mean nothing */
 			if (boot_id && *boot_id && strcmp(l + 5, "-") &&
 			    strcmp(l + 5, boot_id))
-				return t->n = 0;
+				return t->n = t->nra = 0;
+			continue;
+		}
+		if (!strncmp(l, "ra ", 3)) {
+			if (t->nra < GUARD_MAX_RA &&
+			    !parse_ra(l, &t->ra[t->nra], now))
+				t->nra++;
 			continue;
 		}
 		if (l[0] == '#' || t->n >= GUARD_MAX ||

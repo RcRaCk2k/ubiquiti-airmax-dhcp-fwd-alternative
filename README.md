@@ -109,6 +109,7 @@ the DHCP server handed out can be used (IP source guard plus ARP inspection):
 | `source_guard.grace=SECONDS` | learn only, do not block, for this long after the start (default `0`) |
 | `source_guard.max_bindings=N` | per port and kind: IPv4 addresses, IPv6 addresses (IA_NA) and delegated prefixes (IA_PD) are counted separately (default 16). `1` allows one router: one IPv4 address, one IPv6 address and one prefix. A new lease beyond the limit replaces the binding renewed longest ago, e.g. that of a replaced router |
 | `source_guard.lease_file=PATH` | default `/var/run/dhcp-snooping-82.leases` |
+| `source_guard.slaac=eui64\|prefix\|no` | SLAAC addresses from the uplink router's prefixes, for clients with a DHCP binding: `eui64` (default) only the address formed from the client's MAC, `prefix` the whole /64, `no` none |
 
 * **Learning:** a DHCPACK (from the uplink, to the customer port it is
   delivered to) binds `yiaddr` to `chaddr` for the lease time. A DHCPv6 Reply
@@ -130,9 +131,18 @@ the DHCP server handed out can be used (IP source guard plus ARP inspection):
   it. After a reboot the file is gone; the customer's router normally asks
   again after the link flap. If it may not, because a switch keeps the link
   up, set a grace period, e.g. `source_guard.grace=600`.
-* Not covered: static addresses, and SLAAC addresses if the upstream router
-  offers SLAAC prefixes on the customer's link. These never appear in a DHCP
-  reply and are blocked.
+* **SLAAC:** many routers form their own WAN address from the operator's
+  router advertisement (a /64 with the A flag) and use DHCPv6 only for the
+  delegated prefix. The agent reads the RAs arriving on the uplink (a copy,
+  they are forwarded as before) and, for every client MAC that has a DHCP
+  binding on the port, allows the modified EUI-64 address of that MAC in
+  each prefix (`slaac=prefix`: the whole /64) for the prefix's valid
+  lifetime. These bindings go with the client's last DHCP binding or the
+  prefix. The prefixes are kept in the lease file; RAs repeat every few
+  minutes anyway. Privacy (temporary) addresses in the operator's /64 need
+  `slaac=prefix`.
+* Not covered: static addresses. They never appear in a DHCP reply and are
+  blocked.
 
 Rules for explicit ports:
 

@@ -19,7 +19,9 @@
  * only if the bridge hook returned the frame, i.e. a broute DROP. A socket
  * bound to ETH_P_IP on a bridge port therefore never sees frames the bridge
  * forwarded itself, so a missing rule cannot cause duplicates. The same
- * holds for the ETH_P_IPV6 sockets used for DHCPv6.
+ * holds for the ETH_P_IPV6 sockets used for DHCPv6. Only the source
+ * guard's RA socket on the uplinks is an ETH_P_ALL tap: it must see the
+ * router advertisements the bridge forwards, and it only reads.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -208,6 +210,19 @@ static struct sock_filter bpf_client6[] = {
 	{ 0x06, 0, 0, 0 },
 };
 
+/* uplinks, source guard: router advertisements, read only (a copy, the
+ * bridge forwards them as before) */
+static struct sock_filter bpf_ra[] = {
+	{ 0x28, 0, 0, 12 },		/* ldh [12]            */
+	{ 0x15, 0, 5, ETH_P_IPV6_ },	/* jne IPv6 -> drop    */
+	{ 0x30, 0, 0, 20 },		/* ldb [20] next hdr   */
+	{ 0x15, 0, 3, 58 },		/* jne ICMPv6 -> drop  */
+	{ 0x30, 0, 0, 54 },		/* ldb [54] type       */
+	{ 0x15, 0, 1, 134 },		/* jne RA -> drop      */
+	{ 0x06, 0, 0, 0xffff },
+	{ 0x06, 0, 0, 0 },
+};
+
 /* ND/MLD of a client port is not limited like DHCP */
 #define ICMP6_RATE	200
 #define ICMP6_BURST	400
@@ -293,6 +308,7 @@ struct bucket {
 struct pstate {
 	int		fd;
 	int		fd6;		/* DHCPv6, -1 if off */
+	int		fd_ra;		/* uplink RAs for the guard, -1 if off */
 	int		ifindex;
 	struct bucket	tb;
 	struct bucket	tb_icmp6;
@@ -903,6 +919,44 @@ static int handle_uplink6(int port, time_t now)
 	return 0;
 }
 
+/* SLAAC prefixes the router announces on an uplink */
+static int handle_ra(int port)
+{
+	static uint8_t buf[FRAME_BUF_LEN];
+	struct dhcp6_lease l[GUARD_MAX_RA];
+	struct guard_msg m;
+	struct sockaddr_ll sll;
+	int i, k, n;
+
+	for (i = 0; i < BURST_PER_POLL; i++) {
+		socklen_t sl = sizeof(sll);
+		ssize_t len = recvfrom(ps[port].fd_ra, buf, sizeof(buf), MSG_TRUNC,
+				       (struct sockaddr *)&sll, &sl);
+
+		if (len < 0)
+			return 0;
+		if (sll.sll_pkttype == PACKET_OUTGOING ||
+		    (size_t)len > sizeof(buf))
+			continue;
+		n = dhcp6_ra_prefixes(buf, (size_t)len, l, GUARD_MAX_RA);
+		log_pkt(LOG_LVL_DEBUG, "ra-seen if=%s/%d len=%d slaac_prefixes=%d",
+			cfg.port[port].name, ps[port].ifindex, (int)len, n);
+		if (n > 0)
+			st.guard_ra++;
+		for (k = 0; k < n; k++) {
+			memset(&m, 0, sizeof(m));
+			m.op = GUARD_RA;
+			m.v6 = 1;
+			m.plen = l[k].plen;
+			snprintf(m.port, sizeof(m.port), "%s", cfg.port[port].name);
+			memcpy(m.addr, l[k].addr, 16);
+			m.lifetime = l[k].valid;
+			guard_send(&m);
+		}
+	}
+	return 0;
+}
+
 static void drop_privileges(void)
 {
 	if (!cfg.worker_uid || getuid() != 0)
@@ -918,8 +972,9 @@ static int worker(unsigned restarts)
 {
 	struct sock_fprog preq = BPF(bpf_request), prep = BPF(bpf_reply);
 	struct sock_fprog p6 = BPF(bpf_dhcp6), pc6 = BPF(bpf_client6);
-	struct pollfd pfd[2 * MAX_PORTS];
-	int pport[2 * MAX_PORTS], pv6[2 * MAX_PORTS];
+	struct sock_fprog pra = BPF(bpf_ra);
+	struct pollfd pfd[3 * MAX_PORTS];
+	int pport[3 * MAX_PORTS], pv6[3 * MAX_PORTS];	/* 2: RA */
 	int i, rc = 0, npfd = 0;
 	time_t started = mono(), t_stats = 0, t_if = 0, t_win;
 	uint32_t win_marked = 0, win_answered = 0;
@@ -941,6 +996,16 @@ static int worker(unsigned restarts)
 			if (ps[i].fd6 < 0)
 				return EXIT_RESTART;
 		}
+		ps[i].fd_ra = -1;
+		if (guard_fd >= 0 && cfg.sg_ipv6 && cfg.dhcp6_snooping &&
+		    cfg.sg_slaac && p->role == ROLE_UPLINK) {
+			/* a tap: frames the bridge forwards never reach
+			 * a socket bound to one protocol */
+			ps[i].fd_ra = open_packet(p->name, ETH_P_ALL_, &pra,
+						  &ps[i].ifindex);
+			if (ps[i].fd_ra < 0)
+				return EXIT_RESTART;
+		}
 		ps[i].tb.tokens = cfg.rate_burst;
 		ps[i].tb.last = started;
 		ps[i].tb_icmp6.tokens = ICMP6_BURST;
@@ -952,6 +1017,11 @@ static int worker(unsigned restarts)
 			pfd[npfd] = (struct pollfd){ ps[i].fd6, POLLIN, 0 };
 			pport[npfd] = i;
 			pv6[npfd++] = 1;
+		}
+		if (ps[i].fd_ra >= 0) {
+			pfd[npfd] = (struct pollfd){ ps[i].fd_ra, POLLIN, 0 };
+			pport[npfd] = i;
+			pv6[npfd++] = 2;
 		}
 		LOGI("worker: %s %s/%d (on %s) circuit_id=\"%.*s\"",
 		     role_str(p->role), p->name, ps[i].ifindex,
@@ -981,7 +1051,9 @@ static int worker(unsigned restarts)
 				LOGW("socket error on %s", cfg.port[pi].name);
 				r = -1;
 			} else if (pfd[i].revents & POLLIN) {
-				if (pv6[i])
+				if (pv6[i] == 2)
+					r = handle_ra(pi);
+				else if (pv6[i])
 					r = client ? handle_client6(pi, now) :
 						     handle_uplink6(pi, now);
 				else
@@ -1038,6 +1110,7 @@ static int worker(unsigned restarts)
 /* watcher: source guard */
 
 static struct guard_tab gtab;
+static int guard_started;	/* enabled, learning (grace) or active */
 static int guard_active;	/* rules in place (grace is over) */
 static int guard_dirty;		/* an incremental change failed: rebuild */
 static time_t guard_from;	/* end of the grace period */
@@ -1062,7 +1135,34 @@ static void guard_del_cb(const struct binding *b, void *ctx)
 		guard_dirty = 1;
 }
 
-static const struct guard_ops guard_ops = { guard_add_cb, guard_del_cb, NULL };
+static int port_index(const char *name, int role)
+{
+	int i;
+
+	for (i = 0; i < cfg.nport; i++)
+		if (cfg.port[i].role == role && !strcmp(cfg.port[i].name, name))
+			return i;
+	return -1;
+}
+
+static int guard_same_bridge(const char *client, const char *uplink, void *ctx)
+{
+	int c = port_index(client, ROLE_CLIENT), u = port_index(uplink, ROLE_UPLINK);
+
+	return c >= 0 && u >= 0 && cfg.port[c].bridge == cfg.port[u].bridge;
+}
+
+static const struct guard_ops guard_ops = { guard_add_cb, guard_del_cb, NULL,
+					    guard_same_bridge };
+/* before a full install: no rule changes, no log */
+static const struct guard_ops guard_quiet = { NULL, NULL, NULL,
+					      guard_same_bridge };
+
+/* GUARD_SLAAC_* in effect */
+static int guard_slaac(void)
+{
+	return cfg.sg_ipv6 && cfg.dhcp6_snooping ? cfg.sg_slaac : GUARD_SLAAC_OFF;
+}
 
 static const char *boot_id(void)
 {
@@ -1119,13 +1219,7 @@ static int guard_load_file(struct guard_tab *t, const char *bid)
 
 static int is_client_port(const char *name, void *arg)
 {
-	int i;
-
-	for (i = 0; i < cfg.nport; i++)
-		if (cfg.port[i].role == ROLE_CLIENT &&
-		    !strcmp(cfg.port[i].name, name))
-			return 1;
-	return 0;
+	return port_index(name, ROLE_CLIENT) >= 0;
 }
 
 static void guard_start(void)
@@ -1133,10 +1227,13 @@ static void guard_start(void)
 	int n = guard_load_file(&gtab, boot_id());
 
 	guard_why = "port no longer a client port";
-	if (guard_retain(&gtab, is_client_port, NULL, NULL))
-		guard_save_file();
+	guard_retain(&gtab, is_client_port, NULL, NULL);
+	guard_sync(&gtab, guard_slaac(), &guard_quiet);
+	guard_save_file();
 	guard_from = mono() + (time_t)cfg.sg_grace;
-	LOGI("source guard: %d bindings from %s, %s", n, cfg.sg_lease_file,
+	guard_started = 1;
+	LOGI("source guard: %d bindings from %s, %d SLAAC prefixes, %s", n,
+	     cfg.sg_lease_file, gtab.nra,
 	     cfg.sg_grace ? "learning only during the grace period" :
 	     "blocking now");
 }
@@ -1169,6 +1266,24 @@ static void guard_read(time_t now)
 			int r;
 
 			m[i].port[sizeof(m[i].port) - 1] = '\0';
+			if (m[i].op == GUARD_RA) {
+				char a[48];
+
+				if (!guard_slaac() ||
+				    port_index(m[i].port, ROLE_UPLINK) < 0)
+					continue;
+				r = guard_ra(&gtab, &m[i], now);
+				if (r == GUARD_CHANGED)
+					LOGI("source guard: SLAAC prefix %s/64 on %s %s",
+					     ip6_str(m[i].addr, a), m[i].port,
+					     m[i].lifetime ? "learned" : "withdrawn");
+				else if (r == GUARD_FULL)
+					LOGW("source guard: more than %d SLAAC "
+					     "prefixes, ignoring %s/64",
+					     GUARD_MAX_RA, ip6_str(m[i].addr, a));
+				save |= r == GUARD_RENEWED || r == GUARD_CHANGED;
+				continue;
+			}
 			if (!cfg.sg_enable || !is_client_port(m[i].port, NULL) ||
 			    (m[i].v6 && !(cfg.sg_ipv6 && cfg.dhcp6_snooping)))
 				continue;
@@ -1182,8 +1297,11 @@ static void guard_read(time_t now)
 			save |= r == GUARD_RENEWED || r == GUARD_CHANGED;
 		}
 	}
-	if (save)
-		guard_save_file();
+	if (!save)
+		return;
+	guard_why = "no DHCP binding or prefix left";
+	guard_sync(&gtab, guard_slaac(), &guard_ops);
+	guard_save_file();
 }
 
 /* once a second: grace period, expiry, failed changes */
@@ -1197,8 +1315,11 @@ static void guard_tick(time_t now)
 		guard_install();
 	}
 	guard_why = "expired";
-	if (guard_expire(&gtab, now, &guard_ops))
+	if (guard_expire(&gtab, now, &guard_ops)) {
+		guard_why = "no DHCP binding left";
+		guard_sync(&gtab, guard_slaac(), &guard_ops);
 		guard_save_file();
+	}
 	if (guard_active && guard_dirty && now >= guard_retry)
 		guard_install();
 }
@@ -1349,16 +1470,21 @@ static int watcher(void)
 				if (child > 0)
 					kill(child, SIGTERM);
 				guard_why = "port no longer a client port";
-				if (!cfg.sg_enable && guard_active) {
-					ebt_guard_remove(&cfg);
-					guard_active = 0;
-				} else if (cfg.sg_enable && !guard_active) {
+				if (!cfg.sg_enable) {
+					if (guard_active)
+						ebt_guard_remove(&cfg);
+					guard_active = guard_started = 0;
+				} else if (!guard_started) {
 					guard_start();
-				} else if (cfg.sg_enable) {
+				} else {
+					/* the grace period keeps running */
 					guard_retain(&gtab, is_client_port, NULL,
 						     NULL);
+					guard_sync(&gtab, guard_slaac(),
+						   &guard_quiet);
 					guard_save_file();
-					guard_install();
+					if (guard_active)
+						guard_install();
 				}
 			}
 		}
@@ -1604,10 +1730,13 @@ static void print_config(void)
 	printf("source_guard    %s", cfg.sg_enable ? "yes" : "no");
 	if (cfg.sg_enable)
 		printf(" ipv6=%s block_ip_only=%s grace=%us max_bindings=%u "
-		       "lease_file=%s", cfg.sg_ipv6 && cfg.dhcp6_snooping ? "yes" :
+		       "lease_file=%s slaac=%s",
+		       cfg.sg_ipv6 && cfg.dhcp6_snooping ? "yes" :
 		       cfg.sg_ipv6 ? "no (needs dhcpv6.snooping)" : "no",
 		       cfg.sg_block_ip_only ? "yes" : "no", cfg.sg_grace,
-		       cfg.sg_max_bindings, cfg.sg_lease_file);
+		       cfg.sg_max_bindings, cfg.sg_lease_file,
+		       !guard_slaac() ? "no" : cfg.sg_slaac == GUARD_SLAAC_EUI64 ?
+		       "eui64" : "prefix");
 	printf("\n");
 	printf("rate_limit      %u/s burst %u per port\n", cfg.rate_pps,
 	       cfg.rate_burst);
@@ -1640,10 +1769,22 @@ static int status(void)
 		int g, i;
 
 		guard_load_file(&t, boot_id());
+		guard_sync(&t, guard_slaac(), &guard_quiet);
 		g = ebt_guard_check(&cfg, &t);
 		printf("source_guard_rules %s (counters: ebtables -t filter -L %s "
 		       "--Lc)\n", g == 1 ? "ok" : g == 0 ?
 		       "missing or grace period" : "error", EBT_GUARD_CHAIN);
+		for (i = 0; i < t.nra; i++) {
+			char a[48];
+
+			printf("slaac_prefix %s %s/64 ", t.ra[i].port,
+			       ip6_str(t.ra[i].prefix, a));
+			if (t.ra[i].expires)
+				printf("expires in %lds\n",
+				       (long)(t.ra[i].expires - mono()));
+			else
+				printf("never expires\n");
+		}
 		for (i = 0; i < t.n; i++)
 			if (t.b[i].expires)
 				printf("binding %s expires in %lds\n",

@@ -49,7 +49,16 @@ static void on_del(const struct binding *b, void *ctx)
 	binding_str(b, last);
 }
 
-static const struct guard_ops ops = { on_add, on_del, NULL };
+static const struct guard_ops ops = { on_add, on_del, NULL, NULL };
+
+/* eth0/eth1 are on the bridge of uplink ath0, eth2 on another one */
+static int same_br(const char *client, const char *uplink, void *ctx)
+{
+	return strcmp(client, "eth2") ? !strcmp(uplink, "ath0") :
+	       !strcmp(uplink, "ath1");
+}
+
+static const struct guard_ops ops_br = { on_add, on_del, NULL, same_br };
 
 static const uint8_t MAC_A[6] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
 static const uint8_t MAC_B[6] = { 0x02, 0x66, 0x77, 0x88, 0x99, 0xaa };
@@ -398,12 +407,189 @@ static void test_msgs6(void)
 	CHECK(guard_msgs6(f, n, "eth0", 0, m, 8) == 0);
 }
 
+/* router advertisement: one SLAAC prefix, one without the A flag, one
+ * that is not a /64 */
+static size_t frame_ra(uint8_t *f, uint32_t valid, int hops)
+{
+	static const uint8_t pio[3][8] = {
+		{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0x12, 0x70 },
+		{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0x00, 0x99 },
+		{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0x00, 0x00 },
+	};
+	uint8_t *ip = f + 14, *o;
+	int i;
+
+	memset(f, 0, 200);
+	memcpy(f, "\x33\x33\x00\x00\x00\x01\x02\x00\x5e\x00\x53\x01", 12);
+	put16(f + 12, 0x86dd);
+	ip[0] = 0x60;
+	ip[6] = 58;
+	ip[7] = (uint8_t)hops;
+	ip[8] = 0xfe;
+	ip[9] = 0x80;
+	ip[23] = 1;
+	ip[24] = 0xff;
+	ip[25] = 0x02;
+	ip[39] = 1;
+	o = f + 54;
+	o[0] = 134;
+	o[6] = 0x07;		/* router lifetime 1800 */
+	o[7] = 0x08;
+	o += 16;
+	o[0] = 1;		/* source link-layer address */
+	o[1] = 1;
+	memcpy(o + 2, f + 6, 6);
+	o += 8;
+	for (i = 0; i < 3; i++, o += 32) {
+		o[0] = 3;
+		o[1] = 4;
+		o[2] = i == 2 ? 56 : 64;
+		o[3] = i == 1 ? 0x80 : 0xc0;
+		put32(o + 4, valid);
+		put32(o + 8, valid / 2);
+		memcpy(o + 16, pio[i], 8);
+	}
+	put16(ip + 4, (unsigned)(o - (f + 54)));
+	return (size_t)(o - f);
+}
+
+static struct guard_msg ra_msg(const char *port, const uint8_t *prefix,
+			       uint32_t life)
+{
+	struct guard_msg m;
+
+	memset(&m, 0, sizeof(m));
+	m.op = GUARD_RA;
+	m.v6 = 1;
+	m.plen = 64;
+	snprintf(m.port, sizeof(m.port), "%s", port);
+	memcpy(m.addr, prefix, 16);
+	m.lifetime = life;
+	return m;
+}
+
+static int find(const struct guard_tab *t, const char *s)
+{
+	char b[96];
+	int i;
+
+	for (i = 0; i < t->n; i++)
+		if (!strcmp(binding_str(&t->b[i], b), s))
+			return i;
+	return -1;
+}
+
+static void test_slaac(void)
+{
+	static struct guard_tab t, u;
+	static char buf[8192];
+	struct dhcp6_lease l[8];
+	static const uint8_t ll[16] = { 0xfe, 0x80 };
+	struct guard_msg ra;
+	uint8_t f[256];
+	size_t len = frame_ra(f, 2592000, 255);
+	int i;
+
+	/* parser */
+	CHECK(dhcp6_ra_prefixes(f, len, l, 8) == 1);
+	CHECK(l[0].plen == 64 && l[0].valid == 2592000 &&
+	      l[0].addr[6] == 0x12 && l[0].addr[7] == 0x70 && !l[0].addr[8]);
+	CHECK(dhcp6_ra_prefixes(f, len, l, 0) == 0);
+	len = frame_ra(f, 2592000, 64);		/* forwarded: not a router's */
+	CHECK(dhcp6_ra_prefixes(f, len, l, 8) == -1);
+	len = frame_ra(f, 2592000, 255);
+	CHECK(dhcp6_ra_prefixes(f, len - 1, l, 8) == -1);	/* truncated */
+	f[54] = 135;
+	CHECK(dhcp6_ra_prefixes(f, len, l, 8) == -1);		/* not an RA */
+	f[54] = 134;
+	f[14 + 8] = 0x20;
+	CHECK(dhcp6_ra_prefixes(f, len, l, 8) == -1);		/* global source */
+
+	/* prefix table */
+	ra = ra_msg("ath0", l[0].addr, 1800);
+	CHECK(guard_ra(&t, &ra, 100) == GUARD_CHANGED && t.nra == 1);
+	CHECK(guard_ra(&t, &ra, 100) == GUARD_NOCHANGE);
+	CHECK(guard_ra(&t, &ra, 200) == GUARD_RENEWED);
+	CHECK(t.ra[0].expires == 200 + 1800 + GUARD_SLACK);
+
+	/* no DHCP binding: no SLAAC binding */
+	adds = dels = 0;
+	CHECK(guard_sync(&t, GUARD_SLAAC_EUI64, &ops_br) == GUARD_NOCHANGE);
+	CHECK(t.n == 0);
+	/* a DHCPv4 lease makes the client's EUI-64 address valid */
+	apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "192.0.2.10", 0, 3600), 200);
+	apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "2001:db8:1::/56", 56, 7200), 200);
+	apply(&t, msg(GUARD_LEARN, "eth2", MAC_B, "192.0.2.11", 0, 3600), 200);
+	adds = 0;
+	CHECK(guard_sync(&t, GUARD_SLAAC_EUI64, &ops_br) == GUARD_CHANGED);
+	CHECK(adds == 1 && t.n == 4);	/* once per MAC, not for eth2 */
+	i = find(&t, "eth0 02:11:22:33:44:55 2001:db8:0:1270:11:22ff:fe33:4455 slaac");
+	CHECK(i >= 0 && t.b[i].plen == 128 && t.b[i].expires == t.ra[0].expires);
+	/* the second sync and an RA renew change no rule */
+	adds = dels = 0;
+	CHECK(guard_sync(&t, GUARD_SLAAC_EUI64, &ops_br) == GUARD_NOCHANGE);
+	guard_ra(&t, &ra, 300);
+	CHECK(guard_sync(&t, GUARD_SLAAC_EUI64, &ops_br) == GUARD_RENEWED);
+	CHECK(adds == 0 && dels == 0 && t.b[i].expires == 300 + 1800 + GUARD_SLACK);
+	/* DHCP-learned addresses never touch the SLAAC binding */
+	CHECK(apply(&t, msg(GUARD_FORGET, "eth0", MAC_A,
+			    "2001:db8:0:1270:11:22ff:fe33:4455", 0, 0), 300) ==
+	      GUARD_NOCHANGE);
+	/* the whole /64 instead */
+	CHECK(guard_sync(&t, GUARD_SLAAC_PREFIX, &ops_br) == GUARD_CHANGED);
+	CHECK(find(&t, "eth0 02:11:22:33:44:55 2001:db8:0:1270::/64 slaac") >= 0);
+	CHECK(find(&t, "eth0 02:11:22:33:44:55 2001:db8:0:1270:11:22ff:fe33:4455 slaac") < 0);
+	guard_sync(&t, GUARD_SLAAC_EUI64, &ops_br);
+
+	/* lease file: the prefix, not the derived binding */
+	len = guard_save(&t, "b", 300, buf, sizeof(buf));
+	CHECK(len > 0 && strstr(buf, "ra ath0 2001:db8:0:1270::/64 2110 1810s\n"));
+	CHECK(!strstr(buf, "slaac"));
+	CHECK(guard_load(&u, buf, "b", 301) == 3 && u.nra == 1);
+	guard_sync(&u, GUARD_SLAAC_EUI64, &ops_br);
+	CHECK(u.n == 4);
+	CHECK(guard_load(&u, "ra ath0 2001:db8::1/64 never\n"
+			 "ra ath0 2001:db8::/48 never\n", NULL, 0) == 0 &&
+	      u.nra == 0);
+
+	/* the last DHCP binding of the MAC goes: so does its SLAAC one */
+	apply(&t, msg(GUARD_FORGET, "eth0", MAC_A, "192.0.2.10", 0, 0), 400);
+	dels = 0;
+	CHECK(guard_sync(&t, GUARD_SLAAC_EUI64, &ops_br) == GUARD_NOCHANGE);
+	apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "2001:db8:1::/56", 56, 0), 400);
+	CHECK(guard_sync(&t, GUARD_SLAAC_EUI64, &ops_br) == GUARD_CHANGED);
+	CHECK(dels == 2 && t.n == 1);
+	/* prefix withdrawn (lifetime 0) and expiry */
+	apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "192.0.2.10", 0, 3600), 400);
+	guard_sync(&t, GUARD_SLAAC_EUI64, &ops_br);
+	CHECK(t.n == 3);
+	ra.lifetime = 0;
+	CHECK(guard_ra(&t, &ra, 500) == GUARD_CHANGED && t.nra == 0);
+	CHECK(guard_sync(&t, GUARD_SLAAC_EUI64, &ops_br) == GUARD_CHANGED);
+	CHECK(t.n == 2);
+	ra.lifetime = 10;
+	guard_ra(&t, &ra, 500);
+	guard_sync(&t, GUARD_SLAAC_EUI64, &ops_br);
+	CHECK(t.n == 3);
+	CHECK(guard_expire(&t, 521, &ops_br) == 1 && t.nra == 0 && t.n == 2);
+	/* off */
+	guard_ra(&t, &ra, 600);
+	guard_sync(&t, GUARD_SLAAC_EUI64, &ops_br);
+	CHECK(guard_sync(&t, GUARD_SLAAC_OFF, &ops_br) == GUARD_CHANGED && t.n == 2);
+	/* invalid prefixes */
+	ra = ra_msg("ath0", ll, 60);
+	CHECK(guard_ra(&t, &ra, 600) == GUARD_INVALID);
+	ra.plen = 56;
+	CHECK(guard_ra(&t, &ra, 600) == GUARD_INVALID);
+}
+
 int main(void)
 {
 	test_learn_renew_release();
 	test_moved_and_nak();
 	test_invalid_and_full();
 	test_one_per_kind();
+	test_slaac();
 	test_expire_retain();
 	test_save_load();
 	test_msg4();

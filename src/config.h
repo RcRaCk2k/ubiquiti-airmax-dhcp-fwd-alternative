@@ -88,6 +88,8 @@ struct config {
 	int		sg_block_ip_only;	/* 0: also PPPoE and other frames */
 	unsigned	sg_grace;		/* seconds after start: learn only */
 	unsigned	sg_max_bindings;	/* per port */
+	int		sg_slaac;		/* GUARD_SLAAC_*: 0 off, 1 eui64,
+						 * 2 prefix */
 	char		sg_lease_file[128];
 
 	int		existing_o82;		/* POL_FORWARD | POL_DROP */

@@ -130,6 +130,12 @@ struct dhcp6_lease {
 int dhcp6_leases(const uint8_t *frame, size_t len, struct dhcp6_lease *out,
 		 int max);
 
+/* SLAAC prefixes (Prefix Information with the A flag, /64) of a router
+ * advertisement from a router (link-local source, hop limit 255).
+ * Returns how many, -1 if the frame is no such RA. */
+int dhcp6_ra_prefixes(const uint8_t *frame, size_t len,
+		      struct dhcp6_lease *out, int max);
+
 /* 1 if the Interface-ID decoded into info is cfg's */
 int dhcp6_ifid_matches(const struct dhcp6_info *info,
 		       const struct ldra_cfg *cfg);

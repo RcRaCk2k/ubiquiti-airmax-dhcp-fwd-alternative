@@ -179,6 +179,12 @@ check "source guard options" \
 	'source_guard    yes ipv6=yes block_ip_only=no grace=600s max_bindings=4'
 ARGS="-u br1:eth0 -t br1:ath0.1284 source_guard.enable=yes dhcpv6.snooping=no"
 check "IPv6 source guard needs DHCPv6 snooping" 'ipv6=no (needs dhcpv6.snooping)'
+ARGS="-u br1:eth0 -t br1:ath0.1284 source_guard.enable=yes source_guard.slaac=prefix"
+check "source guard SLAAC prefix" 'lease_file=/var/run/dhcp-snooping-82.leases slaac=prefix'
+ARGS="-u br1:eth0 -t br1:ath0.1284 source_guard.enable=yes source_guard.slaac=no"
+check "source guard SLAAC off" 'slaac=no'
+ARGS="source_guard.slaac=maybe"
+check "source guard bad SLAAC mode" 'invalid value for source_guard.slaac: maybe'
 ARGS="source_guard.max_bindings=0"
 check "source guard bad value" 'invalid value for source_guard.max_bindings: 0'
 ARGS="source_guard.bogus=1"

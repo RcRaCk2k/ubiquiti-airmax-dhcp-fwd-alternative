@@ -323,6 +323,42 @@ int dhcp6_leases(const uint8_t *frame, size_t len, struct dhcp6_lease *out,
 	return n;
 }
 
+int dhcp6_ra_prefixes(const uint8_t *frame, size_t len,
+		      struct dhcp6_lease *out, int max)
+{
+	const uint8_t *ip = frame + OFF_IP6;
+	size_t o, end;
+	int n = 0;
+
+	/* ICMPv6 directly behind the IPv6 header: RFC 4861 routers send
+	 * no extension headers, anything else is not ours to learn from */
+	if (len < OFF_UDP + 16 || get16(frame + 12) != ETH_P_IPV6_ ||
+	    ip[0] >> 4 != 6 || ip[6] != 58 || ip[7] != 255 ||
+	    ip[8] != 0xfe || (ip[9] & 0xc0) != 0x80)
+		return -1;
+	end = OFF_UDP + get16(ip + 4);
+	if (end > len || frame[OFF_UDP] != 134 || frame[OFF_UDP + 1])
+		return -1;
+	for (o = OFF_UDP + 16; o + 2 <= end;) {
+		size_t olen = (size_t)frame[o + 1] * 8;
+
+		if (!olen || o + olen > end)
+			return -1;
+		/* Prefix Information: length, flags (L 0x80, A 0x40), valid,
+		 * preferred, reserved, prefix */
+		if (frame[o] == 3 && olen == 32 && frame[o + 2] == 64 &&
+		    (frame[o + 3] & 0x40) && n < max) {
+			memset(out[n].addr, 0, 16);
+			memcpy(out[n].addr, frame + o + 16, 8);
+			out[n].plen = 64;
+			out[n].valid = get32(frame + o + 4);
+			n++;
+		}
+		o += olen;
+	}
+	return n;
+}
+
 int dhcp6_ifid_matches(const struct dhcp6_info *info,
 		       const struct ldra_cfg *cfg)
 {

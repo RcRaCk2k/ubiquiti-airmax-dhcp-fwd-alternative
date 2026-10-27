@@ -68,6 +68,7 @@ void config_defaults(struct config *c)
 	c->sg_block_ip_only = 1;
 	c->sg_grace = 0;
 	c->sg_max_bindings = 16;
+	c->sg_slaac = 1;
 	copy(c->sg_lease_file, sizeof(c->sg_lease_file), DEFAULT_LEASEFILE);
 	c->existing_o82 = POL_FORWARD;
 	c->reply_foreign = POL_DROP;
@@ -306,6 +307,19 @@ static int set_key(struct config *c, const char *sec, const char *key,
 		}
 		if (!strcasecmp(key, "lease_file"))
 			return STR(c->sg_lease_file);
+		if (!strcasecmp(key, "slaac")) {
+			int on;
+
+			if (!strcasecmp(val, "eui64"))
+				c->sg_slaac = 1;
+			else if (!strcasecmp(val, "prefix"))
+				c->sg_slaac = 2;
+			else if (!parse_bool(val, &on) && !on)
+				c->sg_slaac = 0;
+			else
+				return -1;
+			return 0;
+		}
 		return -2;
 	}
 	if (KEY("reply", "foreign_option82"))
