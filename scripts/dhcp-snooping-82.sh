@@ -27,6 +27,7 @@ set -u
 
 DIR=/etc/persistent/dhcp-snooping-82
 BIN=$DIR/dhcp-fwd
+CONF=dhcp-snooping-82.conf
 TARGET=/bin/dhcp-fwd
 MARKER=/var/run/dhcp-snooping-82.rolledback
 LOG=/var/log/dhcp-snooping-82.log
@@ -76,9 +77,10 @@ cmd_install() {
 	if [ "$src" != "$DIR" ]; then
 		cp "$src/dhcp-fwd" "$BIN.new" && mv "$BIN.new" "$BIN" || die "copy binary"
 		cp "$src/dhcp-snooping-82.sh" "$DIR/dhcp-snooping-82.sh" || die "copy script"
-		[ -f "$DIR/dhcp-snooping-82.conf" ] || cp "$src/dhcp-snooping-82.conf" "$DIR/" ||
-			die "copy config"
+		cp "$src/$CONF.example" "$DIR/$CONF.example" || die "copy example config"
 	fi
+	# local settings are kept; the example always shows every current key
+	[ -f "$DIR/$CONF" ] || cp "$DIR/$CONF.example" "$DIR/$CONF" || die "create config"
 	chmod 755 "$BIN" "$DIR/dhcp-snooping-82.sh"
 	"$BIN" -v >/dev/null 2>&1 || die "binary does not run on this device"
 	self_check || die "configuration check failed"

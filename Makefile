@@ -76,10 +76,10 @@ toolchain:
 DIST_NAME := dhcp-snooping-82-$(VERSION)
 dist: mips
 	@rm -rf $(BUILD)/dist && mkdir -p $(BUILD)/dist/$(DIST_NAME)
-	cp $(MIPS_BIN) scripts/dhcp-snooping-82.sh etc/dhcp-snooping-82.conf \
+	cp $(MIPS_BIN) scripts/dhcp-snooping-82.sh etc/dhcp-snooping-82.conf.example \
 		README.md LICENSE $(BUILD)/dist/$(DIST_NAME)/
 	cd $(BUILD)/dist/$(DIST_NAME) && sha256sum dhcp-fwd dhcp-snooping-82.sh \
-		dhcp-snooping-82.conf > SHA256SUMS
+		dhcp-snooping-82.conf.example > SHA256SUMS
 	cd $(BUILD)/dist && tar --owner=0 --group=0 --mtime=@0 --sort=name \
 		-cf - $(DIST_NAME) | gzip -9n > $(DIST_NAME)-mips.tar.gz
 	cp $(MIPS_BIN) $(BUILD)/dist/dhcp-fwd-$(VERSION)-mips

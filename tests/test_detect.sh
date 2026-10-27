@@ -183,6 +183,21 @@ ARGS="source_guard.max_bindings=0"
 check "source guard bad value" 'invalid value for source_guard.max_bindings: 0'
 ARGS="source_guard.bogus=1"
 check "source guard unknown key" 'unknown option source_guard.bogus'
+# the example, with [system] pointing to the fake tree after its own
+ARGS="-u br1:eth0 -t br1:ath0.1284"
+{ cat "$top/etc/dhcp-snooping-82.conf.example"
+  printf '[system]\nroot = %s\nsystem_cfg = %s\n' "$W/root" "$W/system.cfg"
+} > "$W/example.conf"
+cp "$W/example.conf" "$W/agent.conf"
+check "example config: every key accepted, defaults" \
+	'port            br1/eth0 client' 'source_guard    no'
+refute "example config: no error" 'E: '
+conf "[source_guard]
+enable = yes"
+check "config file with only source_guard enable" \
+	'port            br1/eth0 client' \
+	'source_guard    yes ipv6=yes block_ip_only=yes grace=0s'
+conf ""
 ARGS="-o nosuch.key=1"
 check "-o unknown key" 'unknown option nosuch.key'
 ARGS="-o foo"

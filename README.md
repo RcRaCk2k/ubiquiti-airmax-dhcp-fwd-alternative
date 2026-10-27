@@ -154,7 +154,7 @@ Rules for explicit ports:
 
 ```sh
 # on the PC
-scp build/mips/dhcp-fwd scripts/dhcp-snooping-82.sh etc/dhcp-snooping-82.conf root@DEVICE:/tmp/
+scp build/mips/dhcp-fwd scripts/dhcp-snooping-82.sh etc/dhcp-snooping-82.conf.example root@DEVICE:/tmp/
 # on the device
 sh /tmp/dhcp-snooping-82.sh install                            # to /etc/persistent/dhcp-snooping-82, checks the binary
 /etc/persistent/dhcp-snooping-82/dhcp-fwd --check              # detected bridges, ports, IDs
@@ -164,6 +164,20 @@ sh /tmp/dhcp-snooping-82.sh install                            # to /etc/persist
 # only when everything works, save to flash:
 sh /etc/persistent/dhcp-snooping-82/dhcp-snooping-82.sh install --save
 ```
+
+Configuration: airOS init starts `/bin/dhcp-fwd` with its own fixed
+arguments, so settings such as `source_guard.enable=yes` belong in
+`/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.conf`. `install` creates it
+from `dhcp-snooping-82.conf.example` (every key with its default) only if it
+does not exist yet, and always refreshes the `.example` next to it. The file
+may contain just the keys that differ:
+
+```ini
+[source_guard]
+enable = yes
+```
+
+`killall -HUP dhcp-fwd` reloads it; check the result with `dhcp-fwd --check`.
 
 `install` and `activate` also work while the relay is disabled in the UI. This
 is the recommended order: install and activate first, then enable the relay

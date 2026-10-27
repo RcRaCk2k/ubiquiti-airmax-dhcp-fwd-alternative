@@ -1,5 +1,13 @@
-# dhcp-snooping-82 configuration (/etc/persistent/dhcp-snooping-82/dhcp-snooping-82.conf)
-# All keys are optional; the values shown are the defaults.
+# dhcp-snooping-82 configuration, every key with its default.
+#
+# "install" copies this file to /etc/persistent/dhcp-snooping-82/ as
+# dhcp-snooping-82.conf.example (always, as a reference for the installed
+# version) and as dhcp-snooping-82.conf (only if there is none yet, so local
+# settings survive updates). The agent reads only dhcp-snooping-82.conf.
+# All keys are optional: a file with just
+#   [source_guard]
+#   enable = yes
+# changes only that. Changes take effect on SIGHUP (killall -HUP dhcp-fwd).
 
 [interface]
 # Explicit ports, as a vendor UI would pass them with -u/-t. If any is
