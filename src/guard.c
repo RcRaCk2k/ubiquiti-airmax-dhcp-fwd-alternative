@@ -23,6 +23,13 @@ static int same_addr(const struct binding *b, int v6, const uint8_t *addr,
 	       !memcmp(b->addr, addr, v6 ? 16 : 4);
 }
 
+/* limits count IPv4 addresses, IPv6 addresses (IA_NA/IA_TA) and delegated
+ * prefixes (IA_PD) separately, so one stack never crowds out the other */
+static int kind(int v6, unsigned plen)
+{
+	return !v6 ? 0 : plen == 128 ? 1 : 2;
+}
+
 static void remove_at(struct guard_tab *t, int i, const struct guard_ops *ops)
 {
 	struct binding gone = t->b[i];
@@ -88,7 +95,7 @@ int guard_apply(struct guard_tab *t, const struct guard_msg *m, time_t now,
 	struct binding *b;
 	time_t expires;
 	unsigned on_port = 0;
-	int i;
+	int i, oldest = -1;
 
 	if (m->op == GUARD_FORGET_MAC)
 		return m->v6 ? GUARD_INVALID : forget(t, m, addr, ops);
@@ -121,9 +128,22 @@ int guard_apply(struct guard_tab *t, const struct guard_msg *m, time_t now,
 			remove_at(t, i, ops);
 		}
 	}
-	for (i = 0; i < t->n; i++)
-		on_port += !strcmp(t->b[i].port, m->port);
-	if (on_port >= max_per_port || t->n >= GUARD_MAX)
+	for (i = 0; i < t->n; i++) {
+		b = &t->b[i];
+		if (strcmp(b->port, m->port) ||
+		    kind(b->v6, b->plen) != kind(m->v6, m->plen))
+			continue;
+		on_port++;
+		/* the one renewed longest ago, "never" last */
+		if (oldest < 0 || (b->expires && (!t->b[oldest].expires ||
+						  b->expires < t->b[oldest].expires)))
+			oldest = i;
+	}
+	/* the server just handed this out, so it wins over the binding that
+	 * was renewed longest ago, e.g. that of a replaced router */
+	if (on_port >= max_per_port)
+		remove_at(t, oldest, ops);
+	if (t->n >= GUARD_MAX)
 		return GUARD_FULL;
 	b = &t->b[t->n++];
 	memset(b, 0, sizeof(*b));

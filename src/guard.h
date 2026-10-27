@@ -66,7 +66,7 @@ enum {
 	GUARD_NOCHANGE = 0,
 	GUARD_RENEWED,		/* expiry moved, rules unchanged */
 	GUARD_CHANGED,		/* bindings added or removed */
-	GUARD_FULL,		/* port has max bindings, not added */
+	GUARD_FULL,		/* table full (GUARD_MAX), not added */
 	GUARD_INVALID,		/* address not usable as a binding */
 };
 

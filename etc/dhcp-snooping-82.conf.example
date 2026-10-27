@@ -81,7 +81,10 @@ block_ip_only = yes      # no: also drop PPPoE and every other non-IP frame
 # 0: block at once. A station reboot flaps the customer's link and the router
 # asks again; with a switch in between it may not, then a grace period helps.
 grace = 0
-max_bindings = 16        # per port
+# per port, counted separately for IPv4 addresses, IPv6 addresses (IA_NA)
+# and delegated prefixes (IA_PD): 1 = one router with one of each. A new
+# lease beyond the limit replaces the binding renewed longest ago.
+max_bindings = 16
 lease_file = /var/run/dhcp-snooping-82.leases   # RAM, survives agent restarts
 
 [forwarding]

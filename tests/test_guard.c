@@ -163,19 +163,53 @@ static void test_invalid_and_full(void)
 	CHECK(apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "::", 0, 60), 1) ==
 	      GUARD_INVALID);
 	CHECK(t.n == 0);
-	/* limit per port is 4 here */
+	/* limit per port and kind is 4 here; the newest lease replaces the
+	 * one renewed longest ago */
 	CHECK(apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "2001:db8::1", 0, 60), 1) ==
 	      GUARD_CHANGED);
-	apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "2001:db8::2", 0, 60), 1);
+	apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "2001:db8::2", 0, 50), 1);
 	apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "2001:db8::3", 0, 60), 1);
 	apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "2001:db8::4", 0, 60), 1);
+	dels = 0;
 	CHECK(apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "2001:db8::5", 0, 60), 1) ==
-	      GUARD_FULL);
-	CHECK(apply(&t, msg(GUARD_LEARN, "eth1", MAC_A, "2001:db8::5", 0, 60), 1) ==
 	      GUARD_CHANGED);
-	/* renewing an existing one still works when full */
+	CHECK(dels == 1 && !strncmp(last, "eth0 02:11:22:33:44:55 2001:db8::5", 34));
+	CHECK(t.n == 4);
+	CHECK(apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "2001:db8::2", 0, 60), 1) ==
+	      GUARD_CHANGED);	/* it was the one replaced */
+	/* prefixes and IPv4 have limits of their own */
+	CHECK(apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "2001:db8:1::/56", 56, 60),
+		    1) == GUARD_CHANGED);
+	CHECK(apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "192.0.2.10", 0, 60), 1) ==
+	      GUARD_CHANGED);
+	CHECK(t.n == 6);
+	CHECK(apply(&t, msg(GUARD_LEARN, "eth1", MAC_A, "2001:db8::6", 0, 60), 1) ==
+	      GUARD_CHANGED);
+	/* renewing an existing one changes nothing else */
+	dels = 0;
 	CHECK(apply(&t, msg(GUARD_LEARN, "eth0", MAC_A, "2001:db8::4", 0, 90), 1) ==
 	      GUARD_RENEWED);
+	CHECK(dels == 0);
+}
+
+/* max_bindings = 1: one IPv4 address, one IPv6 address and one prefix */
+static void test_one_per_kind(void)
+{
+	struct guard_tab t = { .n = 0 };
+	const struct guard_msg v4 = msg(GUARD_LEARN, "eth0", MAC_A, "192.0.2.10", 0, 600);
+	const struct guard_msg na = msg(GUARD_LEARN, "eth0", MAC_A, "2001:db8::10", 0, 600);
+	const struct guard_msg pd = msg(GUARD_LEARN, "eth0", MAC_A, "2001:db8:1::/56", 56, 600);
+	const struct guard_msg v4b = msg(GUARD_LEARN, "eth0", MAC_B, "192.0.2.11", 0, 600);
+
+	CHECK(guard_apply(&t, &pd, 1, 1, &ops) == GUARD_CHANGED);
+	CHECK(guard_apply(&t, &v4, 1, 1, &ops) == GUARD_CHANGED);
+	CHECK(guard_apply(&t, &na, 1, 1, &ops) == GUARD_CHANGED);
+	CHECK(t.n == 3);
+	/* a second router on the port replaces the first one's IPv4 */
+	dels = 0;
+	CHECK(guard_apply(&t, &v4b, 5, 1, &ops) == GUARD_CHANGED);
+	CHECK(dels == 1 && !strncmp(last, "eth0 02:66:77:88:99:aa 192.0.2.11", 33));
+	CHECK(t.n == 3 && guard_count(&t, 0) == 1 && guard_count(&t, 1) == 2);
 }
 
 static int keep_eth0(const char *port, void *arg)
@@ -369,6 +403,7 @@ int main(void)
 	test_learn_renew_release();
 	test_moved_and_nak();
 	test_invalid_and_full();
+	test_one_per_kind();
 	test_expire_retain();
 	test_save_load();
 	test_msg4();

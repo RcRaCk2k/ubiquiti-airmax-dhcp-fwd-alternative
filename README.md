@@ -107,7 +107,7 @@ the DHCP server handed out can be used (IP source guard plus ARP inspection):
 | `source_guard.ipv6=yes\|no` | also guard IPv6 (default `yes`, needs `dhcpv6.snooping=yes`) |
 | `source_guard.block_ip_only=yes\|no` | `yes` (default): only IPv4, ARP and IPv6 are filtered; `no`: PPPoE and every other non-IP frame from the port is dropped too |
 | `source_guard.grace=SECONDS` | learn only, do not block, for this long after the start (default `0`) |
-| `source_guard.max_bindings=N` | bindings per port (default 16) |
+| `source_guard.max_bindings=N` | per port and kind: IPv4 addresses, IPv6 addresses (IA_NA) and delegated prefixes (IA_PD) are counted separately (default 16). `1` allows one router: one IPv4 address, one IPv6 address and one prefix. A new lease beyond the limit replaces the binding renewed longest ago, e.g. that of a replaced router |
 | `source_guard.lease_file=PATH` | default `/var/run/dhcp-snooping-82.leases` |
 
 * **Learning:** a DHCPACK (from the uplink, to the customer port it is

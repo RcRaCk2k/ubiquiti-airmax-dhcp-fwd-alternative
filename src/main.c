@@ -1177,8 +1177,8 @@ static void guard_read(time_t now)
 			r = guard_apply(&gtab, &m[i], now, cfg.sg_max_bindings,
 					&guard_ops);
 			if (r == GUARD_FULL)
-				LOGW("source guard: %s has %u bindings, not adding "
-				     "another", m[i].port, cfg.sg_max_bindings);
+				LOGW("source guard: binding table full (%d), not "
+				     "adding one for %s", GUARD_MAX, m[i].port);
 			save |= r == GUARD_RENEWED || r == GUARD_CHANGED;
 		}
 	}
