@@ -1284,8 +1284,9 @@ static void guard_read(time_t now)
 				save |= r == GUARD_RENEWED || r == GUARD_CHANGED;
 				continue;
 			}
-			if (!cfg.sg_enable || !is_client_port(m[i].port, NULL) ||
-			    (m[i].v6 && !(cfg.sg_ipv6 && cfg.dhcp6_snooping)))
+			/* IPv6 leases are learned with ipv6=no too (they get
+			 * no rules then), so turning it on loses nothing */
+			if (!cfg.sg_enable || !is_client_port(m[i].port, NULL))
 				continue;
 			guard_why = m[i].op == GUARD_LEARN ? "lifetime 0 or replaced" :
 				    m[i].op == GUARD_FORGET ? "released" : "NAK";
