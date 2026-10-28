@@ -6,7 +6,7 @@
 #   make toolchain  fetch the pinned Zig toolchain
 #   make ebt-arp    ebt_arp.ko for airOS 6 (downloads kernel + gcc 4.8)
 
-VERSION    := 0.3.0
+VERSION    := 0.3.1
 ZIG        ?= $(CURDIR)/.toolchain/zig-linux-x86_64-0.13.0/zig
 TARGET     := mips-linux-musl
 MCPU       := mips32r2+soft_float
