@@ -61,6 +61,28 @@ comment_enabled() {
 
 wanted() { relay_enabled || comment_enabled; }
 
+# airOS 6 ships no ebt_arp, so the source guard cannot bind ARP there. The
+# package may carry one built for that kernel (tools/build-ebt_arp.sh). It is
+# loaded only for an enabled source guard, only if the firmware has none and
+# only into the kernel it was built for (vermagic of the firmware's own
+# ebt_ip.ko). 0 = loaded just now.
+load_ebt_arp() {
+	kver=$(uname -r)
+	ko=$DIR/ebt_arp-$kver-airos6.ko
+	ref=/lib/modules/$kver/ebt_ip.ko
+	[ -f "$ko" ] && [ -f "$ref" ] || return 1
+	[ -f "/lib/modules/$kver/ebt_arp.ko" ] && return 1
+	grep -q '^ebt_arp ' /proc/modules && return 1
+	"$BIN" --check 2>/dev/null | grep -q '^source_guard *yes' || return 1
+	if [ "$(grep -a -o 'vermagic=[[:print:]]*' "$ko")" != \
+	     "$(grep -a -o 'vermagic=[[:print:]]*' "$ref")" ]; then
+		log "WARNING: $ko does not match this kernel, ARP stays unbound"
+		return 1
+	fi
+	insmod "$ko" || { log "WARNING: insmod $ko failed"; return 1; }
+	log "loaded $ko"
+}
+
 # the line airOS writes when the relay is enabled
 INITTAB=/etc/inittab
 INITTAB_LINE="null::respawn:$TARGET -n -c /etc/dhcp-fwd.conf"
@@ -113,6 +135,10 @@ cmd_install() {
 		cp "$src/dhcp-fwd" "$BIN.new" && mv "$BIN.new" "$BIN" || die "copy binary"
 		cp "$src/dhcp-snooping-82.sh" "$DIR/dhcp-snooping-82.sh" || die "copy script"
 		cp "$src/$CONF.example" "$DIR/$CONF.example" || die "copy example config"
+		for ko in "$src"/ebt_arp-*-airos6.ko; do
+			[ -f "$ko" ] || continue
+			cp "$ko" "$DIR/" || die "copy $ko"
+		done
 	fi
 	# local settings are kept; the example always shows every current key
 	[ -f "$DIR/$CONF" ] || cp "$DIR/$CONF.example" "$DIR/$CONF" || die "create config"
@@ -154,6 +180,7 @@ cmd_activate() {
 		mount -o bind "$BIN" "$TARGET" || die "bind mount failed"
 	fi
 	rm -f "$MARKER"
+	load_ebt_arp
 	# init respawns /bin/dhcp-fwd, which now is our binary
 	killall dhcp-fwd 2>/dev/null
 	sync_inittab
@@ -201,8 +228,14 @@ cmd_ensure() {
 	if is_active; then
 		sync_inittab
 		# after an Apply: the bridge comment may have changed (airOS 8
-		# restarts dhcp-fwd anyway, airOS 6 without relay does not)
-		killall -HUP dhcp-fwd 2>/dev/null
+		# restarts dhcp-fwd anyway, airOS 6 without relay does not); the
+		# agent probes for ARP matching only once, so a newly loaded
+		# ebt_arp needs a restart
+		if load_ebt_arp; then
+			killall dhcp-fwd 2>/dev/null
+		else
+			killall -HUP dhcp-fwd 2>/dev/null
+		fi
 		echo "active"
 		return 0
 	fi
@@ -217,6 +250,7 @@ cmd_status() {
 	comment_enabled && echo "bridge comment: dhcp-option-82=yes" ||
 		echo "bridge comment: no dhcp-option-82=yes"
 	echo "processes: $(pidof dhcp-fwd)"
+	grep -q '^ebt_arp ' /proc/modules && echo "ebt_arp: loaded"
 	[ -x "$BIN" ] && "$BIN" --status
 }
 

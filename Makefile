@@ -4,6 +4,7 @@
 #   make host       native build (diagnosis on a Linux PC)
 #   make test       unit tests on the host
 #   make toolchain  fetch the pinned Zig toolchain
+#   make ebt-arp    ebt_arp.ko for airOS 6 (downloads kernel + gcc 4.8)
 
 VERSION    := 0.3.0
 ZIG        ?= $(CURDIR)/.toolchain/zig-linux-x86_64-0.13.0/zig
@@ -23,7 +24,7 @@ BUILD      := build
 MIPS_BIN   := $(BUILD)/mips/dhcp-fwd
 HOST_BIN   := $(BUILD)/host/dhcp-fwd
 
-.PHONY: all mips host test integration toolchain clean dist
+.PHONY: all mips host test integration toolchain clean dist ebt-arp
 
 all: mips
 
@@ -71,15 +72,20 @@ test: $(BUILD)/test_dhcp $(BUILD)/test_dhcp6 $(BUILD)/test_guard host
 toolchain:
 	sh tools/fetch-toolchain.sh
 
-# release assets: tarball (binary, script, config, docs) plus the bare
-# binary, both listed in SHA256SUMS; reproducible like the binary itself
+EBT_ARP := $(BUILD)/ebt_arp/ebt_arp-2.6.32.71-airos6.ko
+ebt-arp:
+	sh tools/build-ebt_arp.sh
+
+# release assets: tarball (binary, script, config, docs, and ebt_arp.ko for
+# airOS 6 if built) plus the bare binary, all listed in SHA256SUMS;
+# reproducible like the binary itself
 DIST_NAME := dhcp-snooping-82-$(VERSION)
 dist: mips
 	@rm -rf $(BUILD)/dist && mkdir -p $(BUILD)/dist/$(DIST_NAME)
 	cp $(MIPS_BIN) scripts/dhcp-snooping-82.sh etc/dhcp-snooping-82.conf.example \
-		README.md LICENSE $(BUILD)/dist/$(DIST_NAME)/
+		README.md LICENSE $(wildcard $(EBT_ARP)) $(BUILD)/dist/$(DIST_NAME)/
 	cd $(BUILD)/dist/$(DIST_NAME) && sha256sum dhcp-fwd dhcp-snooping-82.sh \
-		dhcp-snooping-82.conf.example > SHA256SUMS
+		dhcp-snooping-82.conf.example $(notdir $(wildcard $(EBT_ARP))) > SHA256SUMS
 	cd $(BUILD)/dist && tar --owner=0 --group=0 --mtime=@0 --sort=name \
 		-cf - $(DIST_NAME) | gzip -9n > $(DIST_NAME)-mips.tar.gz
 	cp $(MIPS_BIN) $(BUILD)/dist/dhcp-fwd-$(VERSION)-mips

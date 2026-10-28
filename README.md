@@ -45,10 +45,41 @@ make              # build/mips/dhcp-fwd: static, MIPS32r2 BE, soft-float
 make test         # unit tests (ASan/UBSan, fuzzing), tshark check, port detection
 make integration  # bridge simulation in network namespaces, no root needed
 make dist         # build/dist/: release tarball, bare binary, SHA256SUMS
+make ebt-arp      # build/ebt_arp/: ebt_arp.ko for airOS 6 (before make dist)
 ```
 
 The build is reproducible: the same sources give a bit-identical binary, its
 SHA256 is written to `build/mips/dhcp-fwd.sha256`.
+
+### ebt_arp for airOS 6
+
+airOS 6 lacks `ebt_arp.ko`, and Ubiquiti publishes no GPL archive for
+XW.v6.3.26. `tools/build-ebt_arp.sh` therefore builds it from vanilla Linux
+2.6.32.71 with the OpenWrt 14.07 ar71xx toolchain (gcc 4.8 Linaro, the
+compiler named in the device's `/proc/version`), both SHA256 verified, and
+adjusts the kernel where the device's structures differ from vanilla:
+
+* `struct sk_buff`: Ubiquiti's fields move `len`, `data_len` and `data` to
+  0x70, 0x74 and 0xc4, the only fields `ebt_arp` reads
+  (`skb_header_pointer`); a padding field and no `NETWORK_SECMARK` put them
+  there.
+* `struct module` (312 bytes, `exit` at 0x130): OpenWrt's MIPS module
+  relocation fields, no `CONFIG_CONSTRUCTORS`; modules with one `.text` and
+  short calls like the firmware's own.
+
+`tools/check-ebt_arp.sh DIR` runs the cross-check: `ebt_ip.ko` and
+`ebt_ip6.ko` built the same way must match those from the device's
+`/lib/modules/2.6.32.71` (in `DIR`) in vermagic, `struct module`, every
+load/store offset, symbols, relocation types and the match registration;
+`ebt_arp` reads no field these two do not. Only the register allocation
+differs (Linaro 4.8-2014.01 on the device, 2014.04 here). On a station the
+module was loaded and its rules counted the customer's ARP packets with the
+right sender IP and MAC, nothing for a wrong IP or MAC. The build is
+reproducible.
+
+`ensure`/`activate` load it only with `[source_guard] enable = yes`, only if
+the firmware has no `ebt_arp` and only if its vermagic equals that of the
+firmware's `ebt_ip.ko`.
 
 ## Command line
 
@@ -139,9 +170,11 @@ the DHCP server handed out can be used (IP source guard plus ARP inspection):
   VLAN tagged IPv4/ARP/IPv6 from a customer port is dropped so it cannot
   bypass the rules.
 * **airOS 6** (XW.v6.3.26) has the same kernel but no `ebt_arp` module. The
-  agent detects that at start: IPv4 and IPv6 are bound as usual, ARP passes
-  unchecked (logged as a warning, `--status` shows `source_guard_arp not
-  filtered`).
+  release package carries one built for it (see [ebt_arp for airOS 6](#ebt_arp-for-airos-6));
+  `install` copies it and `ensure`/`activate` load it when the source guard
+  is enabled. Without it the agent detects the missing ARP match at start:
+  IPv4 and IPv6 are bound as usual, ARP passes unchecked (logged as a
+  warning, `--status` shows `source_guard_arp not filtered`).
 * **Restart:** the binding table is written to the lease file on every change
   (RAM, no flash wear), so a restarted agent (e.g. after "Apply") restores
   it. After a reboot the file is gone; the customer's router normally asks
@@ -181,6 +214,7 @@ Rules for explicit ports:
 ```sh
 # on the PC
 scp build/mips/dhcp-fwd scripts/dhcp-snooping-82.sh etc/dhcp-snooping-82.conf.example root@DEVICE:/tmp/
+# airOS 6 with the source guard: also build/ebt_arp/ebt_arp-2.6.32.71-airos6.ko
 # on the device
 sh /tmp/dhcp-snooping-82.sh install                            # to /etc/persistent/dhcp-snooping-82, checks the binary
 /etc/persistent/dhcp-snooping-82/dhcp-fwd --check              # detected bridges, ports, IDs
